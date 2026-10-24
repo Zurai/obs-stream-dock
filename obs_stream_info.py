@@ -2,16 +2,18 @@
 OBS Stream Info
 
 An OBS Python script that serves a small web UI on 127.0.0.1 for use as a
-Custom Browser Dock. From the dock you can set the stream title and category
-on Twitch (YouTube follows later).
+Custom Browser Dock. From the dock you set the stream title and category on
+Twitch and the title (and optionally description) on YouTube.
 
 The HTTP server runs in a background thread inside the OBS process. It starts
 when the script is loaded and shuts down cleanly when the script is unloaded
 (script reload, OBS exit).
 
 Local, never committed:
-  config.local.json      {"twitch_client_id": "..."}
-  data/twitch_tokens.json  access + refresh token
+  config.local.json         client IDs (and the Google client secret)
+  data/twitch_tokens.json   Twitch access + refresh token
+  data/google_tokens.json   Google access + refresh token
+  data/youtube_pending.json title waiting for the YouTube broadcast to exist
 """
 
 import json
@@ -38,20 +40,27 @@ WEB_DIR = os.path.join(SCRIPT_DIR, "web")
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.local.json")
 TWITCH_TOKEN_PATH = os.path.join(DATA_DIR, "twitch_tokens.json")
+GOOGLE_TOKEN_PATH = os.path.join(DATA_DIR, "google_tokens.json")
+YOUTUBE_PENDING_PATH = os.path.join(DATA_DIR, "youtube_pending.json")
 
-TWITCH_SCOPES = "channel:manage:broadcast"
-TWITCH_DEVICE_URL = "https://id.twitch.tv/oauth2/device"
-TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
-TWITCH_VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
-TWITCH_REVOKE_URL = "https://id.twitch.tv/oauth2/revoke"
 TWITCH_HELIX = "https://api.twitch.tv/helix"
-TITLE_MAX_LEN = 140
+TWITCH_TITLE_MAX = 140
+YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_TITLE_MAX = 100
+YOUTUBE_DESCRIPTION_MAX = 5000
+YOUTUBE_GAMING_CATEGORY = "20"
+# How often to look for the YouTube broadcast while a title is pending and
+# OBS is streaming. liveBroadcasts.list costs 1 quota unit (10,000/day).
+YOUTUBE_PENDING_POLL_S = 30
+YOUTUBE_PENDING_MAX_AGE_S = 12 * 3600
 
 _server = None
 _thread = None
 _started_at = None
 _stop = threading.Event()  # tells background workers to quit on unload
+_streaming = threading.Event()  # mirrors the OBS main stream state
 _twitch = None
+_youtube = None
 
 
 def _log(level, msg):
@@ -98,9 +107,13 @@ class ApiError(Exception):
 
 
 def _message(body, fallback="Unknown error"):
-    if isinstance(body, dict):
-        return body.get("message") or body.get("error") or fallback
-    return fallback
+    """Error text from Twitch ({"message"}) or Google ({"error"} / {"error": {"message"}})."""
+    if not isinstance(body, dict):
+        return fallback
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or fallback
+    return body.get("message") or err or body.get("error_description") or fallback
 
 
 def _http(method, url, *, headers=None, form=None, json_body=None, timeout=10):
@@ -129,43 +142,72 @@ def _http(method, url, *, headers=None, form=None, json_body=None, timeout=10):
         raise ApiError(502, f"Network error: {getattr(e, 'reason', e)}")
 
 
-# --- Twitch -------------------------------------------------------------------
+# --- OAuth device flow (shared by Twitch and Google) ----------------------------
 
-class Twitch:
-    """Device Code Flow login (public client, no secret) and Helix calls."""
+class DeviceFlowAccount:
+    """Device Code Flow login with token storage and automatic refresh.
 
-    def __init__(self, client_id):
+    Subclasses set the class attributes and implement _identity().
+    """
+
+    label = "?"
+    device_url = token_url = revoke_url = ""
+    scope_param = "scope"  # Twitch calls it "scopes"
+    scopes = ""
+
+    def __init__(self, client_id, client_secret, token_path):
         self.client_id = client_id
+        self.client_secret = client_secret
+        self.token_path = token_path
         self.lock = threading.RLock()
-        self.tokens = _read_json(TWITCH_TOKEN_PATH)
+        self.tokens = _read_json(token_path)
         self.login = {"state": "idle"}
-        self.last_validated = 0.0
+
+    # hooks
+    def _identity(self, access_token):
+        """Return a dict with at least display_name, stored with the tokens."""
+        raise NotImplementedError
+
+    def _check_session(self):
+        """Optional periodic check, called with the lock held."""
+
+    def configured(self):
+        return bool(self.client_id)
+
+    def _client_form(self):
+        form = {"client_id": self.client_id}
+        if self.client_secret:
+            form["client_secret"] = self.client_secret
+        return form
 
     # state for the UI
     def public_state(self):
         with self.lock:
             t = self.tokens
             return {
-                "configured": bool(self.client_id),
+                "configured": self.configured(),
                 "logged_in": bool(t),
-                "user": {"login": t.get("login"), "display_name": t.get("display_name")} if t else None,
+                "user": {"display_name": t.get("display_name")} if t else None,
                 "login": dict(self.login),
             }
 
     # login
     def start_login(self):
-        if not self.client_id:
-            raise ApiError(400, "No Twitch client ID configured (config.local.json)")
+        if not self.configured():
+            raise ApiError(400, f"{self.label} is not configured (config.local.json)")
         with self.lock:
             if self.login.get("state") == "pending" and time.time() < self.login.get("expires_at", 0):
                 return dict(self.login)
-        status, body = _http("POST", TWITCH_DEVICE_URL, form={"client_id": self.client_id, "scopes": TWITCH_SCOPES})
+        status, body = _http("POST", self.device_url,
+                             form={"client_id": self.client_id, self.scope_param: self.scopes})
         if status != 200:
-            raise ApiError(status, _message(body))
+            raise ApiError(status, f"{self.label}: {_message(body)}")
+        # Twitch says verification_uri, Google says verification_url.
+        uri = body.get("verification_uri") or body.get("verification_url")
         state = {
             "state": "pending",
             "user_code": body["user_code"],
-            "verification_uri": body["verification_uri"],
+            "verification_uri": uri,
             "expires_at": time.time() + int(body.get("expires_in", 1800)),
         }
         with self.lock:
@@ -173,11 +215,11 @@ class Twitch:
         threading.Thread(
             target=self._poll_login,
             args=(body["device_code"], max(int(body.get("interval", 5)), 1), state["expires_at"]),
-            name="obs-stream-info-twitch-login",
+            name=f"obs-stream-info-{self.label.lower()}-login",
             daemon=True,
         ).start()
         try:
-            webbrowser.open(body["verification_uri"])
+            webbrowser.open(uri)
         except Exception:
             pass  # the dock shows the link and code as a fallback
         return dict(state)
@@ -185,34 +227,35 @@ class Twitch:
     def _set_login_error(self, msg):
         with self.lock:
             self.login = {"state": "error", "error": msg}
-        _log(obs.LOG_WARNING, f"Twitch login failed: {msg}")
+        _log(obs.LOG_WARNING, f"{self.label} login failed: {msg}")
 
     def _poll_login(self, device_code, interval, expires_at):
         form = {
-            "client_id": self.client_id,
-            "scopes": TWITCH_SCOPES,
+            **self._client_form(),
             "device_code": device_code,
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         }
+        if self.scope_param == "scopes":  # Twitch wants the scopes again
+            form["scopes"] = self.scopes
         while not _stop.wait(interval):
             if time.time() > expires_at:
                 return self._set_login_error("Code expired, please try again")
             try:
-                status, body = _http("POST", TWITCH_TOKEN_URL, form=form)
+                status, body = _http("POST", self.token_url, form=form)
             except ApiError:
                 continue  # transient network issue, keep polling
             if status == 200:
                 try:
                     tokens = self._tokens_from(body)
-                    tokens.update(self._get_user(tokens["access_token"]))
+                    tokens.update(self._identity(tokens["access_token"]))
                 except ApiError as e:
                     return self._set_login_error(e.message)
                 with self.lock:
                     self.tokens = tokens
-                    self.last_validated = time.time()
-                    _write_json(TWITCH_TOKEN_PATH, tokens)
+                    self.tokens["checked_at"] = time.time()
+                    _write_json(self.token_path, tokens)
                     self.login = {"state": "ok"}
-                _log(obs.LOG_INFO, f"Twitch: logged in as {tokens.get('login')}")
+                _log(obs.LOG_INFO, f"{self.label}: logged in as {tokens.get('display_name')}")
                 return
             msg = _message(body)
             if msg == "authorization_pending":
@@ -220,6 +263,8 @@ class Twitch:
             if msg == "slow_down":
                 interval += 5
                 continue
+            if msg == "access_denied":
+                msg = "Access was denied in the browser"
             return self._set_login_error(msg)
 
     def logout(self):
@@ -227,91 +272,114 @@ class Twitch:
             t = self.tokens
             self.tokens = None
             self.login = {"state": "idle"}
-            _delete(TWITCH_TOKEN_PATH)
-        if t:
+            _delete(self.token_path)
+        if t and self.revoke_url:
             try:
-                _http("POST", TWITCH_REVOKE_URL, form={"client_id": self.client_id, "token": t["access_token"]})
+                _http("POST", self.revoke_url, form={"client_id": self.client_id, "token": t["access_token"]})
             except ApiError:
                 pass
 
     # tokens
-    @staticmethod
-    def _tokens_from(body):
+    def _tokens_from(self, body, previous=None):
         return {
             "access_token": body["access_token"],
-            "refresh_token": body["refresh_token"],
+            # Google does not send a new refresh token on refresh, Twitch does.
+            "refresh_token": body.get("refresh_token") or (previous or {}).get("refresh_token"),
             "expires_at": time.time() + int(body.get("expires_in", 0)),
             "scope": body.get("scope", []),
         }
 
-    def _get_user(self, access_token):
-        status, body = _http(
-            "GET", f"{TWITCH_HELIX}/users",
-            headers={"Authorization": f"Bearer {access_token}", "Client-Id": self.client_id},
-        )
-        if status != 200 or not body or not body.get("data"):
-            raise ApiError(status, _message(body, "Could not read Twitch user"))
-        u = body["data"][0]
-        return {"user_id": u["id"], "login": u["login"], "display_name": u["display_name"]}
-
     def _drop_session(self, reason):
         self.tokens = None
-        _delete(TWITCH_TOKEN_PATH)
-        _log(obs.LOG_WARNING, f"Twitch session dropped: {reason}")
-        raise ApiError(401, "Twitch login expired, please log in again")
+        _delete(self.token_path)
+        _log(obs.LOG_WARNING, f"{self.label} session dropped: {reason}")
+        raise ApiError(401, f"{self.label} login expired, please log in again")
 
     def _refresh(self):
-        # caller holds self.lock. Refresh tokens are single use, so the lock
-        # also makes sure two requests never spend the same one.
-        status, body = _http("POST", TWITCH_TOKEN_URL, form={
-            "client_id": self.client_id,
+        # Caller holds self.lock. Twitch refresh tokens are single use, so the
+        # lock also makes sure two requests never spend the same one.
+        status, body = _http("POST", self.token_url, form={
+            **self._client_form(),
             "grant_type": "refresh_token",
             "refresh_token": self.tokens["refresh_token"],
         })
         if status in (400, 401):
             self._drop_session(_message(body))
         if status != 200:
-            raise ApiError(status, _message(body))
-        self.tokens.update(self._tokens_from(body))
-        self.last_validated = time.time()
-        _write_json(TWITCH_TOKEN_PATH, self.tokens)
+            raise ApiError(status, f"{self.label}: {_message(body)}")
+        self.tokens.update(self._tokens_from(body, self.tokens))
+        self.tokens["checked_at"] = time.time()
+        _write_json(self.token_path, self.tokens)
 
-    def _session(self, force_refresh=False):
+    def access_token(self, force_refresh=False):
         with self.lock:
             if not self.tokens:
-                raise ApiError(401, "Not logged in to Twitch")
-            now = time.time()
-            if force_refresh or now > self.tokens.get("expires_at", 0) - 60:
+                raise ApiError(401, f"Not logged in to {self.label}")
+            if force_refresh or time.time() > self.tokens.get("expires_at", 0) - 60:
                 self._refresh()
-            elif now - self.last_validated > 3600:
-                # Twitch asks apps to validate tokens at least hourly.
-                status, _ = _http("GET", TWITCH_VALIDATE_URL,
-                                  headers={"Authorization": f"OAuth {self.tokens['access_token']}"})
-                if status == 401:
-                    self._refresh()
-                self.last_validated = time.time()
-            return self.tokens["access_token"], self.tokens["user_id"]
+            else:
+                self._check_session()
+            return self.tokens["access_token"]
 
-    def helix(self, method, path, params=None, json_body=None):
+    def request(self, method, url, params=None, json_body=None, extra_headers=None):
+        """Authorized API call, retried once with a fresh token on 401."""
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
         for attempt in (0, 1):
-            token, _ = self._session(force_refresh=(attempt == 1))
-            url = f"{TWITCH_HELIX}{path}"
-            if params:
-                url += "?" + urllib.parse.urlencode(params)
-            status, body = _http(method, url, json_body=json_body, headers={
-                "Authorization": f"Bearer {token}",
-                "Client-Id": self.client_id,
-            })
+            token = self.access_token(force_refresh=(attempt == 1))
+            headers = {"Authorization": f"Bearer {token}", **(extra_headers or {})}
+            status, body = _http(method, url, json_body=json_body, headers=headers)
             if status == 401 and attempt == 0:
                 continue
             if status >= 400:
-                raise ApiError(status, f"Twitch: {_message(body)}")
+                raise ApiError(status, f"{self.label}: {_message(body)}")
             return body
 
-    # API used by the dock
+
+# --- Twitch -------------------------------------------------------------------
+
+class Twitch(DeviceFlowAccount):
+    label = "Twitch"
+    device_url = "https://id.twitch.tv/oauth2/device"
+    token_url = "https://id.twitch.tv/oauth2/token"
+    revoke_url = "https://id.twitch.tv/oauth2/revoke"
+    validate_url = "https://id.twitch.tv/oauth2/validate"
+    scope_param = "scopes"
+    scopes = "channel:manage:broadcast"
+
+    def __init__(self, client_id):
+        super().__init__(client_id, None, TWITCH_TOKEN_PATH)
+
+    def _identity(self, access_token):
+        status, body = _http("GET", f"{TWITCH_HELIX}/users",
+                             headers={"Authorization": f"Bearer {access_token}", "Client-Id": self.client_id})
+        if status != 200 or not body or not body.get("data"):
+            raise ApiError(status, _message(body, "Could not read Twitch user"))
+        u = body["data"][0]
+        return {"user_id": u["id"], "login": u["login"], "display_name": u["display_name"]}
+
+    def _check_session(self):
+        # Twitch asks apps to validate tokens at least hourly.
+        if time.time() - self.tokens.get("checked_at", 0) < 3600:
+            return
+        status, _ = _http("GET", self.validate_url,
+                          headers={"Authorization": f"OAuth {self.tokens['access_token']}"})
+        if status == 401:
+            self._refresh()
+        self.tokens["checked_at"] = time.time()
+
+    def helix(self, method, path, params=None, json_body=None):
+        return self.request(method, f"{TWITCH_HELIX}{path}", params, json_body,
+                            extra_headers={"Client-Id": self.client_id})
+
+    def _user_id(self):
+        with self.lock:
+            if not self.tokens:
+                raise ApiError(401, "Not logged in to Twitch")
+            return self.tokens["user_id"]
+
     def get_channel(self):
-        _, uid = self._session()
-        body = self.helix("GET", "/channels", {"broadcaster_id": uid})
+        body = self.helix("GET", "/channels", {"broadcaster_id": self._user_id()})
         d = body["data"][0]
         return {"title": d["title"], "game_id": d["game_id"], "game_name": d["game_name"]}
 
@@ -331,16 +399,202 @@ class Twitch:
             title = title.strip()
             if not title:
                 raise ApiError(400, "Title must not be empty")
-            if len(title) > TITLE_MAX_LEN:
-                raise ApiError(400, f"Title is longer than {TITLE_MAX_LEN} characters")
+            if len(title) > TWITCH_TITLE_MAX:
+                raise ApiError(400, f"Title is longer than {TWITCH_TITLE_MAX} characters")
             payload["title"] = title
         if game_id:
             payload["game_id"] = str(game_id)
         if not payload:
             raise ApiError(400, "Nothing to update")
-        _, uid = self._session()
-        self.helix("PATCH", "/channels", {"broadcaster_id": uid}, json_body=payload)
+        self.helix("PATCH", "/channels", {"broadcaster_id": self._user_id()}, json_body=payload)
         return self.get_channel()
+
+
+# --- YouTube ------------------------------------------------------------------
+
+class YouTube(DeviceFlowAccount):
+    label = "YouTube"
+    device_url = "https://oauth2.googleapis.com/device/code"
+    token_url = "https://oauth2.googleapis.com/token"
+    revoke_url = "https://oauth2.googleapis.com/revoke"
+    scopes = "https://www.googleapis.com/auth/youtube"
+
+    def __init__(self, client_id, client_secret):
+        super().__init__(client_id, client_secret, GOOGLE_TOKEN_PATH)
+        self.pending = _read_json(YOUTUBE_PENDING_PATH)
+        self.last_result = None  # shown in the dock after a pending title was applied
+        self._watcher = None
+
+    def configured(self):
+        return bool(self.client_id and self.client_secret)
+
+    def public_state(self):
+        state = super().public_state()
+        with self.lock:
+            state["pending"] = dict(self.pending) if self.pending else None
+            state["last_result"] = dict(self.last_result) if self.last_result else None
+        return state
+
+    def _identity(self, access_token):
+        status, body = _http("GET", f"{YOUTUBE_API}/channels?part=snippet&mine=true",
+                             headers={"Authorization": f"Bearer {access_token}"})
+        if status != 200 or not body or not body.get("items"):
+            raise ApiError(status, _message(body, "This Google account has no YouTube channel"))
+        ch = body["items"][0]
+        return {"channel_id": ch["id"], "display_name": ch["snippet"]["title"]}
+
+    def api(self, method, path, params=None, json_body=None):
+        return self.request(method, f"{YOUTUBE_API}{path}", params, json_body)
+
+    # broadcasts
+    def list_broadcasts(self, status):
+        body = self.api("GET", "/liveBroadcasts", {
+            "part": "snippet,status",
+            "broadcastStatus": status,
+            "broadcastType": "all",
+            "maxResults": 10,
+        })
+        return body.get("items", [])
+
+    def find_target(self):
+        """The broadcast a new title should go to: live first, else the next upcoming one."""
+        active = self.list_broadcasts("active")
+        if active:
+            return active[0]
+        upcoming = self.list_broadcasts("upcoming")
+        upcoming.sort(key=lambda b: b["snippet"].get("scheduledStartTime") or "")
+        return upcoming[0] if upcoming else None
+
+    def diagnostics(self):
+        def short(b):
+            s, st = b["snippet"], b.get("status", {})
+            return {
+                "id": b["id"],
+                "title": s.get("title"),
+                "lifeCycleStatus": st.get("lifeCycleStatus"),
+                "privacyStatus": st.get("privacyStatus"),
+                "scheduledStartTime": s.get("scheduledStartTime"),
+                "actualStartTime": s.get("actualStartTime"),
+            }
+        return {
+            "streaming_in_obs": _streaming.is_set(),
+            "active": [short(b) for b in self.list_broadcasts("active")],
+            "upcoming": [short(b) for b in self.list_broadcasts("upcoming")],
+            "recent": [short(b) for b in self.list_broadcasts("all")[:5]],
+        }
+
+    def _apply_to(self, broadcast, title, description):
+        """Set title (and optionally description) on one broadcast."""
+        s = broadcast["snippet"]
+        # liveBroadcasts.update requires scheduledStartTime. Broadcasts that
+        # YouTube creates on its own when you stream with a stream key from
+        # YouTube Studio don't have one, so those go straight to videos.update.
+        if s.get("scheduledStartTime"):
+            snippet = {
+                "title": title,
+                # Omitted fields get cleared by YouTube, so always send the description.
+                "description": s.get("description", "") if description is None else description,
+                "scheduledStartTime": s["scheduledStartTime"],
+            }
+            if s.get("scheduledEndTime"):
+                snippet["scheduledEndTime"] = s["scheduledEndTime"]
+            try:
+                # 1 quota unit
+                self.api("PUT", "/liveBroadcasts", {"part": "snippet"},
+                         json_body={"id": broadcast["id"], "snippet": snippet})
+                return "liveBroadcasts.update"
+            except ApiError as e:
+                if e.status != 400:
+                    raise
+                _log(obs.LOG_INFO, f"liveBroadcasts.update refused ({e.message}), trying videos.update")
+        # Fallback, 50 quota units: the broadcast is also a video.
+        items = self.api("GET", "/videos", {"part": "snippet", "id": broadcast["id"]}).get("items", [])
+        if not items:
+            raise ApiError(404, "YouTube: video for the broadcast not found")
+        vs = items[0]["snippet"]
+        vsnip = {
+            "title": title,
+            "description": vs.get("description", "") if description is None else description,
+            "categoryId": vs.get("categoryId") or YOUTUBE_GAMING_CATEGORY,
+        }
+        for key in ("tags", "defaultLanguage", "defaultAudioLanguage"):
+            if vs.get(key):
+                vsnip[key] = vs[key]
+        self.api("PUT", "/videos", {"part": "snippet"}, json_body={"id": broadcast["id"], "snippet": vsnip})
+        return "videos.update"
+
+    def update(self, title, description=None):
+        title = (title or "").strip()
+        if not title:
+            raise ApiError(400, "Title must not be empty")
+        if len(title) > YOUTUBE_TITLE_MAX:
+            raise ApiError(400, f"YouTube titles are limited to {YOUTUBE_TITLE_MAX} characters")
+        if "<" in title or ">" in title:
+            raise ApiError(400, "YouTube titles must not contain < or >")
+        if description is not None and len(description) > YOUTUBE_DESCRIPTION_MAX:
+            raise ApiError(400, f"Description is longer than {YOUTUBE_DESCRIPTION_MAX} characters")
+
+        target = self.find_target()
+        if target is None:
+            pending = {"title": title, "description": description, "since": time.time()}
+            with self.lock:
+                self.pending = pending
+                self.last_result = None
+                _write_json(YOUTUBE_PENDING_PATH, pending)
+            self.ensure_watcher()
+            return {"applied": False, "pending": True}
+
+        method = self._apply_to(target, title, description)
+        with self.lock:
+            self.pending = None
+            _delete(YOUTUBE_PENDING_PATH)
+        _log(obs.LOG_INFO, f"YouTube title set via {method} on {target['id']}")
+        return {"applied": True, "broadcast_id": target["id"],
+                "status": target.get("status", {}).get("lifeCycleStatus")}
+
+    def clear_pending(self):
+        with self.lock:
+            self.pending = None
+            _delete(YOUTUBE_PENDING_PATH)
+
+    # pending title watcher
+    def ensure_watcher(self):
+        with self.lock:
+            if self.pending and (self._watcher is None or not self._watcher.is_alive()):
+                self._watcher = threading.Thread(target=self._watch, name="obs-stream-info-youtube-watch", daemon=True)
+                self._watcher.start()
+
+    def _watch(self):
+        """While a title is pending and OBS streams, look for the live broadcast."""
+        while not _stop.wait(YOUTUBE_PENDING_POLL_S):
+            with self.lock:
+                pending = dict(self.pending) if self.pending else None
+                logged_in = bool(self.tokens)
+            if not pending or not logged_in:
+                return
+            if time.time() - pending["since"] > YOUTUBE_PENDING_MAX_AGE_S:
+                self.clear_pending()
+                _log(obs.LOG_INFO, "Pending YouTube title dropped after 12 h")
+                return
+            if not _streaming.is_set():
+                continue  # nothing can be live yet, don't spend quota
+            try:
+                active = self.list_broadcasts("active")
+                if not active:
+                    continue
+                self._apply_to(active[0], pending["title"], pending.get("description"))
+            except ApiError as e:
+                _log(obs.LOG_WARNING, f"Applying pending YouTube title failed: {e.message}")
+                with self.lock:
+                    self.last_result = {"ok": False, "error": e.message, "at": time.time()}
+                continue
+            with self.lock:
+                if self.pending and self.pending.get("since") == pending["since"]:
+                    self.pending = None
+                    _delete(YOUTUBE_PENDING_PATH)
+                self.last_result = {"ok": True, "title": pending["title"], "at": time.time()}
+            _log(obs.LOG_INFO, f"Pending YouTube title applied to {active[0]['id']}")
+            return
 
 
 # --- HTTP server ----------------------------------------------------------------
@@ -389,30 +643,43 @@ class _Handler(SimpleHTTPRequestHandler):
     def _api(self, method):
         url = urllib.parse.urlsplit(self.path)
         path, query = url.path, urllib.parse.parse_qs(url.query)
-        tw = _twitch
+        tw, yt = _twitch, _youtube
+        accounts = {"twitch": tw, "youtube": yt}
         try:
-            if method == "GET" and path == "/api/status":
-                return self._send_json(200, {
-                    "ok": True,
-                    "pid": os.getpid(),
-                    "uptime_s": round(time.time() - _started_at, 1),
-                    "twitch": tw.public_state(),
-                })
-            if method == "GET" and path == "/api/twitch/channel":
-                return self._send_json(200, {"ok": True, **tw.get_channel()})
-            if method == "GET" and path == "/api/twitch/categories":
-                q = (query.get("q") or [""])[0]
-                return self._send_json(200, {"ok": True, "data": tw.search_categories(q)})
+            if method == "GET":
+                if path == "/api/status":
+                    return self._send_json(200, {
+                        "ok": True,
+                        "pid": os.getpid(),
+                        "uptime_s": round(time.time() - _started_at, 1),
+                        "streaming": _streaming.is_set(),
+                        "twitch": tw.public_state(),
+                        "youtube": yt.public_state(),
+                    })
+                if path == "/api/twitch/channel":
+                    return self._send_json(200, {"ok": True, **tw.get_channel()})
+                if path == "/api/twitch/categories":
+                    q = (query.get("q") or [""])[0]
+                    return self._send_json(200, {"ok": True, "data": tw.search_categories(q)})
+                if path == "/api/youtube/diagnostics":
+                    return self._send_json(200, {"ok": True, **yt.diagnostics()})
             if method == "POST":
                 body = self._read_json_body()
-                if path == "/api/twitch/login":
-                    return self._send_json(200, {"ok": True, "login": tw.start_login()})
-                if path == "/api/twitch/logout":
-                    tw.logout()
+                parts = path.strip("/").split("/")  # api/<platform>/<action>
+                if len(parts) == 3 and parts[1] in accounts and parts[2] in ("login", "logout"):
+                    acc = accounts[parts[1]]
+                    if parts[2] == "login":
+                        return self._send_json(200, {"ok": True, "login": acc.start_login()})
+                    acc.logout()
                     return self._send_json(200, {"ok": True})
                 if path == "/api/twitch/channel":
                     ch = tw.update_channel(body.get("title"), body.get("game_id"))
                     return self._send_json(200, {"ok": True, **ch})
+                if path == "/api/youtube/broadcast":
+                    return self._send_json(200, {"ok": True, **yt.update(body.get("title"), body.get("description"))})
+                if path == "/api/youtube/pending/clear":
+                    yt.clear_pending()
+                    return self._send_json(200, {"ok": True})
             return self._send_json(404, {"ok": False, "error": "Not found"})
         except ApiError as e:
             status = e.status if 400 <= e.status < 600 else 502
@@ -482,22 +749,43 @@ def _stop_server():
 
 # --- OBS script callbacks ---------------------------------------------------------
 
+def _on_frontend_event(event):
+    if event == obs.OBS_FRONTEND_EVENT_STREAMING_STARTED:
+        _streaming.set()
+        if _youtube is not None:
+            _youtube.ensure_watcher()
+    elif event == obs.OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+        _streaming.clear()
+
+
 def script_description():
     return (
         "<b>OBS Stream Info</b><br>"
-        "Set title and category for Twitch from a dock.<br>"
+        "Set title and category for Twitch and YouTube from a dock.<br>"
         f"Add <code>http://{HOST}:{PORT}/</code> via Docks → Custom Browser Docks."
     )
 
 
 def script_load(settings):
-    global _twitch
+    global _twitch, _youtube
     _stop.clear()
     cfg = _read_json(CONFIG_PATH) or {}
-    client_id = (cfg.get("twitch_client_id") or "").strip()
-    if not client_id:
+    twitch_id = (cfg.get("twitch_client_id") or "").strip()
+    google_id = (cfg.get("google_client_id") or "").strip()
+    google_secret = (cfg.get("google_client_secret") or "").strip()
+    if not twitch_id:
         _log(obs.LOG_WARNING, "No twitch_client_id in config.local.json, Twitch is disabled")
-    _twitch = Twitch(client_id)
+    if not (google_id and google_secret):
+        _log(obs.LOG_WARNING, "No google_client_id/secret in config.local.json, YouTube is disabled")
+    _twitch = Twitch(twitch_id)
+    _youtube = YouTube(google_id, google_secret)
+
+    if obs.obs_frontend_streaming_active():
+        _streaming.set()
+    else:
+        _streaming.clear()
+    obs.obs_frontend_add_event_callback(_on_frontend_event)
+    _youtube.ensure_watcher()  # resume a title left pending before a reload
     _start_server()
 
 

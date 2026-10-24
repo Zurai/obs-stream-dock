@@ -38,6 +38,26 @@ button:disabled { opacity: .5; cursor: default; }
 #results { list-style: none; padding: 0; margin: 8px 0 0; }
 #results li { padding: 2px 0; }
 
+.warn { color: #f9e2af; margin: 4px 0 0; }
+.wait { color: #f9e2af; }
+
+.account { padding: 6px 0 8px; border-bottom: 1px solid var(--border); }
+.account.compact { padding: 3px 0; }
+.account-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
+.account.compact .account-head { margin-bottom: 0; }
+.account-head .logout { margin-left: auto; font-size: 11px; }
+.account .login { width: 100%; }
+#accounts { margin-bottom: 4px; }
+
+textarea { width: 100%; padding: 6px 8px; background: var(--panel); color: var(--text);
+           border: 1px solid var(--border); border-radius: 4px; font: inherit; resize: vertical; margin-top: 4px; }
+textarea:focus { outline: none; border-color: var(--accent); }
+details { margin-top: 8px; }
+summary { cursor: pointer; font-weight: 600; }
+
+#diag { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 6px;
+        font-size: 11px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto; }
+
 footer { margin-top: 14px; padding-top: 6px; border-top: 1px solid var(--border);
          display: flex; gap: 10px; font-size: 11px; }
-footer #logout { margin-left: auto; }
+footer #diag-link { margin-left: auto; }

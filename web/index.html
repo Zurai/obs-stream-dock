@@ -6,43 +6,55 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <section id="login" hidden>
-    <p id="login-text">Connect your Twitch account to set title and category from here.</p>
-    <button id="login-btn" class="primary">Log in with Twitch</button>
-    <div id="login-pending" hidden>
-      <p>A browser window should have opened. If not, go to<br>
-        <a id="login-link" href="#" target="_blank"></a><br>and enter this code:</p>
-      <div id="login-code" class="code"></div>
-      <p class="muted">Waiting for confirmation …</p>
-    </div>
-    <p id="login-error" class="err" hidden></p>
-  </section>
-
-  <section id="not-configured" hidden>
-    <p class="err">No Twitch client ID configured.</p>
-    <p class="muted">Create <code>config.local.json</code> next to the script (see README), then reload the script.</p>
-  </section>
+  <section id="accounts"></section>
 
   <form id="form" hidden autocomplete="off">
     <label for="title">Title <span id="title-count" class="muted"></span></label>
     <input id="title" maxlength="140" placeholder="Stream title">
+    <p id="title-warn" class="warn" hidden></p>
 
-    <label for="category">Category</label>
-    <div class="combo">
-      <img id="category-art" alt="">
-      <input id="category" placeholder="Search Twitch categories">
-      <ul id="suggestions" hidden></ul>
+    <div id="category-block">
+      <label for="category">Category <span class="muted">(Twitch)</span></label>
+      <div class="combo">
+        <img id="category-art" alt="">
+        <input id="category" placeholder="Search Twitch categories">
+        <ul id="suggestions" hidden></ul>
+      </div>
     </div>
+
+    <details id="description-block">
+      <summary>Description <span class="muted">(YouTube, optional)</span></summary>
+      <textarea id="description" rows="4" maxlength="5000" placeholder="Leave empty to keep the current description"></textarea>
+    </details>
 
     <button id="apply" class="primary" type="submit">Apply</button>
     <ul id="results"></ul>
   </form>
 
+  <pre id="diag" hidden></pre>
+
   <footer>
     <span id="server" class="muted">…</span>
-    <span id="account" class="muted"></span>
-    <a id="logout" href="#" hidden>log out</a>
+    <a id="diag-link" href="#" hidden>YouTube diagnostics</a>
   </footer>
+
+<template id="account-tpl">
+  <div class="account">
+    <div class="account-head">
+      <strong class="name"></strong>
+      <span class="who muted"></span>
+      <a class="logout" href="#" hidden>log out</a>
+    </div>
+    <p class="not-configured muted" hidden>Not configured. Add the client ID to <code>config.local.json</code> and reload the script.</p>
+    <button class="login primary" hidden>Log in</button>
+    <div class="pending" hidden>
+      <p>Confirm in your browser. If it didn't open, go to
+        <a class="link" href="#" target="_blank"></a> and enter:</p>
+      <div class="code"></div>
+    </div>
+    <p class="error err" hidden></p>
+  </div>
+</template>
 
 <script src="app.js"></script>
 </body>

@@ -1,3 +1,5 @@
 {
-  "twitch_client_id": "your-twitch-client-id"
+  "twitch_client_id": "your-twitch-client-id",
+  "google_client_id": "your-google-client-id.apps.googleusercontent.com",
+  "google_client_secret": "your-google-client-secret"
 }

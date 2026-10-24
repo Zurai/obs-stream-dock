@@ -1,6 +1,8 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
+const PLATFORMS = { twitch: 'Twitch', youtube: 'YouTube' };
+const YT_TITLE_MAX = 100;
 
 async function api(method, path, body) {
   const opts = { method, cache: 'no-store', headers: {} };
@@ -19,40 +21,81 @@ async function api(method, path, body) {
   return data;
 }
 
-// ---- state / view --------------------------------------------------------
+function show(el, visible) { (typeof el === 'string' ? $(el) : el).hidden = !visible; }
 
-let loginPoll = null;
-let channelLoaded = false;
+// ---- accounts ------------------------------------------------------------
 
-function show(id, visible) { $(id).hidden = !visible; }
+const accountEls = {};
+for (const [key, label] of Object.entries(PLATFORMS)) {
+  const el = $('account-tpl').content.firstElementChild.cloneNode(true);
+  el.querySelector('.name').textContent = label;
+  el.querySelector('.login').textContent = `Log in with ${label}`;
+  el.querySelector('.login').addEventListener('click', async ev => {
+    ev.target.disabled = true;
+    try { await api('POST', `/api/${key}/login`, {}); }
+    catch (e) { setText(el, '.error', e.message); show(el.querySelector('.error'), true); }
+    refresh();
+  });
+  el.querySelector('.logout').addEventListener('click', async ev => {
+    ev.preventDefault();
+    if (!confirm(`Log out of ${label}?`)) return;
+    await api('POST', `/api/${key}/logout`, {}).catch(() => {});
+    refresh();
+  });
+  $('accounts').append(el);
+  accountEls[key] = el;
+}
+
+function setText(root, sel, text) { root.querySelector(sel).textContent = text; }
+
+function renderAccount(key, st) {
+  const el = accountEls[key];
+  const pending = st.login.state === 'pending';
+  show(el.querySelector('.not-configured'), !st.configured);
+  show(el.querySelector('.login'), st.configured && !st.logged_in && !pending);
+  el.querySelector('.login').disabled = false;
+  show(el.querySelector('.logout'), st.logged_in);
+  setText(el, '.who', st.user ? st.user.display_name : (st.configured ? 'not logged in' : ''));
+  show(el.querySelector('.pending'), pending);
+  if (pending) {
+    setText(el, '.code', st.login.user_code);
+    const a = el.querySelector('.link');
+    a.href = st.login.verification_uri;
+    a.textContent = st.login.verification_uri.replace(/^https?:\/\//, '').replace(/\?.*$/, '');
+  }
+  show(el.querySelector('.error'), st.login.state === 'error');
+  if (st.login.state === 'error') setText(el, '.error', st.login.error);
+  el.classList.toggle('compact', st.logged_in);
+  return pending;
+}
+
+// ---- status polling ------------------------------------------------------------
+
+let state = null;
+let fastPoll = null;
+let twitchLoaded = false;
 
 function render(status) {
-  const tw = status.twitch;
-  $('server').textContent = 'plugin online';
+  state = status;
+  $('server').textContent = status.streaming ? 'plugin online · streaming' : 'plugin online';
   $('server').className = 'ok';
 
-  show('not-configured', !tw.configured);
-  show('login', tw.configured && !tw.logged_in);
-  show('form', tw.configured && tw.logged_in);
-  show('logout', tw.logged_in);
-  $('account').textContent = tw.user ? `Twitch: ${tw.user.display_name}` : '';
+  const pending = ['twitch', 'youtube'].map(k => renderAccount(k, status[k])).some(Boolean);
+  const tw = status.twitch.logged_in, yt = status.youtube.logged_in;
 
-  const pending = tw.login.state === 'pending';
-  show('login-pending', pending);
-  $('login-btn').disabled = pending;
-  if (pending) {
-    $('login-code').textContent = tw.login.user_code;
-    $('login-link').href = tw.login.verification_uri;
-    $('login-link').textContent = tw.login.verification_uri.replace(/\?.*$/, '');
-  }
-  show('login-error', tw.login.state === 'error');
-  $('login-error').textContent = tw.login.error || '';
+  show('form', tw || yt);
+  show('category-block', tw);
+  show('description-block', yt);
+  show('diag-link', yt);
+  updateCount();
+  renderYoutubePending(status.youtube);
 
-  if (pending && !loginPoll) loginPoll = setInterval(refresh, 2000);
-  if (!pending && loginPoll) { clearInterval(loginPoll); loginPoll = null; }
+  const wantFast = pending || !!status.youtube.pending;
+  if (wantFast && !fastPoll) fastPoll = setInterval(refresh, 2000);
+  if (!wantFast && fastPoll) { clearInterval(fastPoll); fastPoll = null; }
 
-  if (tw.logged_in && !channelLoaded) { channelLoaded = true; loadChannel(); }
-  if (!tw.logged_in) channelLoaded = false;
+  if (tw && !twitchLoaded) { twitchLoaded = true; loadTwitchChannel(); }
+  if (!tw) twitchLoaded = false;
 }
 
 async function refresh() {
@@ -64,27 +107,50 @@ async function refresh() {
   }
 }
 
-// ---- login -----------------------------------------------------------------
+// ---- results ---------------------------------------------------------------------
 
-$('login-btn').addEventListener('click', async () => {
-  $('login-btn').disabled = true;
-  try {
-    await api('POST', '/api/twitch/login', {});
-  } catch (e) {
-    $('login-error').textContent = e.message;
-    show('login-error', true);
+const results = {};
+
+function result(platform, kind, msg, action) {
+  // kind: ok | err | wait
+  let li = results[platform];
+  if (!li) {
+    li = document.createElement('li');
+    results[platform] = li;
+    $('results').append(li);
   }
-  refresh();
-});
+  li.className = kind;
+  const icon = { ok: '✓', err: '✗', wait: '⏳' }[kind];
+  li.replaceChildren(document.createTextNode(`${icon} ${PLATFORMS[platform]}: ${msg} `));
+  if (action) {
+    const a = document.createElement('a');
+    a.href = '#';
+    a.textContent = action.label;
+    a.addEventListener('click', ev => { ev.preventDefault(); action.run(); });
+    li.append(a);
+  }
+}
 
-$('logout').addEventListener('click', async ev => {
-  ev.preventDefault();
-  if (!confirm('Log out of Twitch?')) return;
-  await api('POST', '/api/twitch/logout', {}).catch(() => {});
-  refresh();
-});
+function clearResults() {
+  for (const k of Object.keys(results)) { results[k].remove(); delete results[k]; }
+}
 
-// ---- channel form ------------------------------------------------------------
+let lastAppliedShown = null;
+
+function renderYoutubePending(yt) {
+  if (yt.pending) {
+    result('youtube', 'wait', 'no broadcast yet, the title will be set as soon as you are live.', {
+      label: 'cancel',
+      run: async () => { await api('POST', '/api/youtube/pending/clear', {}).catch(() => {}); clearResults(); refresh(); },
+    });
+  } else if (yt.last_result && yt.last_result.at !== lastAppliedShown) {
+    lastAppliedShown = yt.last_result.at;
+    if (yt.last_result.ok) result('youtube', 'ok', 'title set now that the stream is live');
+    else result('youtube', 'err', yt.last_result.error);
+  }
+}
+
+// ---- form ------------------------------------------------------------------------
 
 let selected = null; // {id, name, box_art_url}
 
@@ -95,49 +161,64 @@ function setCategory(cat) {
 }
 
 function updateCount() {
-  $('title-count').textContent = `${$('title').value.length}/140`;
+  const n = $('title').value.length;
+  $('title-count').textContent = `${n}/140`;
+  const ytTooLong = state && state.youtube.logged_in && n > YT_TITLE_MAX;
+  show('title-warn', ytTooLong);
+  if (ytTooLong) $('title-warn').textContent = `YouTube allows only ${YT_TITLE_MAX} characters.`;
 }
 $('title').addEventListener('input', updateCount);
 
-async function loadChannel() {
-  try {
-    const ch = await api('GET', '/api/twitch/channel');
-    $('title').value = ch.title;
-    updateCount();
-    setCategory(ch.game_id ? { id: ch.game_id, name: ch.game_name, box_art_url: artUrl(ch.game_id) } : null);
-  } catch (e) {
-    result('Twitch', false, e.message);
-  }
-}
-
-// Box art for a known game id, same CDN pattern Twitch uses in search results.
 function artUrl(gameId) {
   return `https://static-cdn.jtvnw.net/ttv-boxart/${gameId}-52x72.jpg`;
 }
 
-function result(platform, ok, msg) {
-  const li = document.createElement('li');
-  li.className = ok ? 'ok' : 'err';
-  li.textContent = `${ok ? '✓' : '✗'} ${platform}: ${msg}`;
-  $('results').replaceChildren(li);
+async function loadTwitchChannel() {
+  try {
+    const ch = await api('GET', '/api/twitch/channel');
+    if (!$('title').value) $('title').value = ch.title;
+    updateCount();
+    setCategory(ch.game_id ? { id: ch.game_id, name: ch.game_name, box_art_url: artUrl(ch.game_id) } : null);
+  } catch (e) {
+    result('twitch', 'err', e.message);
+  }
+}
+
+async function applyTwitch(title) {
+  const catText = $('category').value.trim();
+  if (catText && (!selected || selected.name !== catText)) {
+    return result('twitch', 'err', 'pick a category from the list');
+  }
+  try {
+    const ch = await api('POST', '/api/twitch/channel', { title, game_id: selected ? selected.id : null });
+    result('twitch', 'ok', `updated (${ch.game_name || 'no category'})`);
+  } catch (e) {
+    result('twitch', 'err', e.message);
+  }
+}
+
+async function applyYoutube(title) {
+  const desc = $('description').value;
+  try {
+    const r = await api('POST', '/api/youtube/broadcast', { title, description: desc.trim() ? desc : null });
+    if (r.applied) result('youtube', 'ok', r.status === 'live' ? 'updated (live)' : `updated (${r.status || 'upcoming'})`);
+  } catch (e) {
+    result('youtube', 'err', e.message);
+  }
 }
 
 $('form').addEventListener('submit', async ev => {
   ev.preventDefault();
   const title = $('title').value.trim();
-  const catText = $('category').value.trim();
-  if (catText && (!selected || selected.name !== catText)) {
-    return result('Twitch', false, 'Pick a category from the list');
-  }
+  if (!title) return;
+  clearResults();
   $('apply').disabled = true;
-  try {
-    const ch = await api('POST', '/api/twitch/channel', { title, game_id: selected ? selected.id : null });
-    result('Twitch', true, `updated (${ch.game_name || 'no category'})`);
-  } catch (e) {
-    result('Twitch', false, e.message);
-  } finally {
-    $('apply').disabled = false;
-  }
+  const jobs = [];
+  if (state.twitch.logged_in) jobs.push(applyTwitch(title));
+  if (state.youtube.logged_in) jobs.push(applyYoutube(title));
+  await Promise.all(jobs);
+  $('apply').disabled = false;
+  refresh();
 });
 
 // ---- category autocomplete ---------------------------------------------------
@@ -150,8 +231,7 @@ let active = -1;
 function closeSuggestions() { show('suggestions', false); items = []; active = -1; }
 
 function renderSuggestions() {
-  const ul = $('suggestions');
-  ul.replaceChildren(...items.map((c, i) => {
+  $('suggestions').replaceChildren(...items.map((c, i) => {
     const li = document.createElement('li');
     if (i === active) li.className = 'active';
     const img = document.createElement('img');
@@ -178,13 +258,13 @@ $('category').addEventListener('input', () => {
     const seq = ++searchSeq;
     try {
       const res = await api('GET', '/api/twitch/categories?q=' + encodeURIComponent(q));
-      if (seq !== searchSeq) return; // a newer search is on its way
+      if (seq !== searchSeq) return;
       items = res.data;
       active = items.length ? 0 : -1;
       renderSuggestions();
     } catch (e) {
       closeSuggestions();
-      result('Twitch', false, e.message);
+      result('twitch', 'err', e.message);
     }
   }, 300);
 });
@@ -198,6 +278,22 @@ $('category').addEventListener('keydown', ev => {
 });
 
 $('category').addEventListener('blur', () => setTimeout(closeSuggestions, 100));
+
+// ---- YouTube diagnostics -----------------------------------------------------------
+
+$('diag-link').addEventListener('click', async ev => {
+  ev.preventDefault();
+  if (!$('diag').hidden) return show('diag', false);
+  $('diag').textContent = 'Loading …';
+  show('diag', true);
+  try {
+    const d = await api('GET', '/api/youtube/diagnostics');
+    delete d.ok;
+    $('diag').textContent = JSON.stringify(d, null, 2);
+  } catch (e) {
+    $('diag').textContent = e.message;
+  }
+});
 
 // ---- start -----------------------------------------------------------------------
 
