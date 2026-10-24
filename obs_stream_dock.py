@@ -1,5 +1,5 @@
 """
-OBS Stream Info
+OBS Stream Dock
 
 An OBS Python script that serves a small web UI on 127.0.0.1 for use as a
 Custom Browser Dock. From the dock you set the stream title and category on
@@ -67,7 +67,7 @@ def _log(level, msg):
     # OBS only knows the current script inside its own callbacks. Messages
     # from our worker threads would show up as "[Unknown Script]", so tag them.
     if threading.current_thread() is not threading.main_thread():
-        msg = f"[obs_stream_info.py] {msg}"
+        msg = f"[{os.path.basename(__file__)}] {msg}"
     obs.script_log(level, msg)
 
 
@@ -215,7 +215,7 @@ class DeviceFlowAccount:
         threading.Thread(
             target=self._poll_login,
             args=(body["device_code"], max(int(body.get("interval", 5)), 1), state["expires_at"]),
-            name=f"obs-stream-info-{self.label.lower()}-login",
+            name=f"obs-stream-dock-{self.label.lower()}-login",
             daemon=True,
         ).start()
         try:
@@ -561,7 +561,7 @@ class YouTube(DeviceFlowAccount):
     def ensure_watcher(self):
         with self.lock:
             if self.pending and (self._watcher is None or not self._watcher.is_alive()):
-                self._watcher = threading.Thread(target=self._watch, name="obs-stream-info-youtube-watch", daemon=True)
+                self._watcher = threading.Thread(target=self._watch, name="obs-stream-dock-youtube-watch", daemon=True)
                 self._watcher.start()
 
     def _watch(self):
@@ -723,7 +723,7 @@ def _start_server():
     _thread = threading.Thread(
         target=_server.serve_forever,
         kwargs={"poll_interval": 0.25},
-        name="obs-stream-info-http",
+        name="obs-stream-dock-http",
         daemon=True,
     )
     _thread.start()
@@ -760,7 +760,7 @@ def _on_frontend_event(event):
 
 def script_description():
     return (
-        "<b>OBS Stream Info</b><br>"
+        "<b>OBS Stream Dock</b><br>"
         "Set title and category for Twitch and YouTube from a dock.<br>"
         f"Add <code>http://{HOST}:{PORT}/</code> via Docks → Custom Browser Docks."
     )

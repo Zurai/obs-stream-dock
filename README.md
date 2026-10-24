@@ -1,10 +1,10 @@
-# OBS Stream Info
+# OBS Stream Dock
 
 Set your stream **title and category on Twitch and YouTube at once**, right from a dock inside OBS Studio. No browser dashboards, no extra apps, no context switching.
 
 > **Status:** early development. Twitch works, YouTube is being tested.
 
-Project page: [zurai.github.io/obs-stream-info](https://zurai.github.io/obs-stream-info/) · [Privacy policy](https://zurai.github.io/obs-stream-info/privacy.html)
+Project page: [zurai.github.io/obs-stream-dock](https://zurai.github.io/obs-stream-dock/) · [Privacy policy](https://zurai.github.io/obs-stream-dock/privacy.html)
 
 ## Why
 
@@ -40,7 +40,7 @@ When you simulcast to Twitch and YouTube, updating the stream title means editin
 3. **YouTube:** in the [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **YouTube Data API v3**, set up the Google Auth Platform (audience *External*, add yourself as a test user or publish the app) and create an OAuth client of type **TVs and Limited Input devices**. Copy client ID and client secret.
    - While the app is in *Testing* mode, Google expires the login after 7 days.
 4. Copy `config.example.json` to `config.local.json` next to the script and fill in the IDs and the secret. This file is ignored by git.
-5. In OBS, add `obs_stream_info.py` under *Tools → Scripts*.
+5. In OBS, add `obs_stream_dock.py` under *Tools → Scripts*.
 6. Add a dock under *Docks → Custom Browser Docks* with the URL `http://127.0.0.1:47823/`.
 7. Log in with Twitch and YouTube in the dock and confirm the codes in your browser.
 
