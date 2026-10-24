@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chat</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="chat-page">
+  <header id="chat-status">
+    <span class="stat"><span class="plat twitch">T</span> <span id="tw-state" class="muted">…</span></span>
+    <span class="stat"><span class="plat youtube">YT</span> <span id="yt-state" class="muted">…</span>
+      <a id="yt-connect" href="#" hidden>connect</a></span>
+  </header>
+
+  <main id="feed" aria-live="polite"></main>
+  <button id="more" hidden>new messages ↓</button>
+
+  <form id="send" autocomplete="off">
+    <div id="send-error" class="err" hidden></div>
+    <div class="send-row">
+      <label class="target twitch" title="Send to Twitch"><input type="checkbox" id="to-twitch" checked><span>T</span></label>
+      <label class="target youtube" title="Send to YouTube"><input type="checkbox" id="to-youtube" checked><span>YT</span></label>
+      <input id="text" placeholder="Send a message" maxlength="500">
+      <span id="count" class="muted"></span>
+    </div>
+  </form>
+
+<script src="chat.js"></script>
+</body>
+</html>

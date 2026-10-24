@@ -1,0 +1,5 @@
+# Only needed for reading YouTube chat (youtube_chat/helper.py).
+# Install into the same Python that OBS uses:
+#   python -m pip install -r requirements.txt
+grpcio>=1.84.1
+protobuf>=7.35.1

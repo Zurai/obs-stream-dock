@@ -52,8 +52,11 @@ function renderAccount(key, st) {
   const el = accountEls[key];
   const pending = st.login.state === 'pending';
   show(el.querySelector('.not-configured'), !st.configured);
-  show(el.querySelector('.login'), st.configured && !st.logged_in && !pending);
+  const needsRelogin = st.logged_in && st.missing_scopes && st.missing_scopes.length > 0;
+  show(el.querySelector('.login'), st.configured && (!st.logged_in || needsRelogin) && !pending);
   el.querySelector('.login').disabled = false;
+  el.querySelector('.login').textContent = needsRelogin
+    ? `Log in again (new permission: chat)` : `Log in with ${PLATFORMS[key]}`;
   show(el.querySelector('.logout'), st.logged_in);
   setText(el, '.who', st.user ? st.user.display_name : (st.configured ? 'not logged in' : ''));
   show(el.querySelector('.pending'), pending);
@@ -65,7 +68,7 @@ function renderAccount(key, st) {
   }
   show(el.querySelector('.error'), st.login.state === 'error');
   if (st.login.state === 'error') setText(el, '.error', st.login.error);
-  el.classList.toggle('compact', st.logged_in);
+  el.classList.toggle('compact', st.logged_in && !needsRelogin);
   return pending;
 }
 

@@ -14,12 +14,19 @@ Local, never committed:
   data/twitch_tokens.json   Twitch access + refresh token
   data/google_tokens.json   Google access + refresh token
   data/youtube_pending.json title waiting for the YouTube broadcast to exist
+
+The chat dock (web/chat.html) reads Twitch chat directly over Twitch's
+anonymous IRC WebSocket and YouTube chat through youtube_chat/helper.py,
+a separate process that holds the gRPC streamList connection.
 """
 
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
+from collections import deque
 import time
 import urllib.error
 import urllib.parse
@@ -54,6 +61,16 @@ YOUTUBE_GAMING_CATEGORY = "20"
 YOUTUBE_PENDING_POLL_S = 30
 YOUTUBE_PENDING_MAX_AGE_S = 12 * 3600
 
+# Chat
+CHAT_HELPER = os.path.join(SCRIPT_DIR, "youtube_chat", "helper.py")
+CHAT_BUFFER = 500                     # YouTube messages kept for the dock
+CHAT_FIND_POLL_S = 30                 # look for the live broadcast (1 unit per check)
+CHAT_FIND_MAX_S = 15 * 60             # give up looking after this long
+CHAT_RETRY_MAX_S = 300                # max wait between reconnects (5 units each)
+TWITCH_CHAT_MAX = 500
+YOUTUBE_CHAT_MAX = 200
+EMOTE_CACHE_S = 30 * 60
+
 _server = None
 _thread = None
 _started_at = None
@@ -61,6 +78,8 @@ _stop = threading.Event()  # tells background workers to quit on unload
 _streaming = threading.Event()  # mirrors the OBS main stream state
 _twitch = None
 _youtube = None
+_ytchat = None
+_emotes = {"at": 0.0, "data": None, "lock": threading.Lock()}
 
 
 def _log(level, msg):
@@ -180,6 +199,16 @@ class DeviceFlowAccount:
             form["client_secret"] = self.client_secret
         return form
 
+    def missing_scopes(self):
+        """Scopes we ask for now but the stored login doesn't have (older login)."""
+        with self.lock:
+            if not self.tokens:
+                return []
+            granted = self.tokens.get("scope") or []
+            if isinstance(granted, str):
+                granted = granted.split()
+            return [s for s in self.scopes.split() if s not in granted]
+
     # state for the UI
     def public_state(self):
         with self.lock:
@@ -189,6 +218,7 @@ class DeviceFlowAccount:
                 "logged_in": bool(t),
                 "user": {"display_name": t.get("display_name")} if t else None,
                 "login": dict(self.login),
+                "missing_scopes": self.missing_scopes(),
             }
 
     # login
@@ -345,7 +375,8 @@ class Twitch(DeviceFlowAccount):
     revoke_url = "https://id.twitch.tv/oauth2/revoke"
     validate_url = "https://id.twitch.tv/oauth2/validate"
     scope_param = "scopes"
-    scopes = "channel:manage:broadcast"
+    # user:write:chat lets the chat dock send messages as you.
+    scopes = "channel:manage:broadcast user:write:chat"
 
     def __init__(self, client_id):
         super().__init__(client_id, None, TWITCH_TOKEN_PATH)
@@ -408,6 +439,26 @@ class Twitch(DeviceFlowAccount):
             raise ApiError(400, "Nothing to update")
         self.helix("PATCH", "/channels", {"broadcaster_id": self._user_id()}, json_body=payload)
         return self.get_channel()
+
+    def chat_identity(self):
+        with self.lock:
+            if not self.tokens:
+                return None
+            return {"login": self.tokens.get("login"), "user_id": self.tokens.get("user_id"),
+                    "display_name": self.tokens.get("display_name"),
+                    "can_send": "user:write:chat" not in self.missing_scopes()}
+
+    def send_chat(self, text):
+        if "user:write:chat" in self.missing_scopes():
+            raise ApiError(403, "Twitch: please log in again to allow sending chat messages")
+        uid = self._user_id()
+        body = self.helix("POST", "/chat/messages", json_body={
+            "broadcaster_id": uid, "sender_id": uid, "message": text})
+        d = (body or {}).get("data", [{}])[0]
+        if not d.get("is_sent"):
+            reason = (d.get("drop_reason") or {}).get("message") or "message was dropped"
+            raise ApiError(400, f"Twitch: {reason}")
+        return d.get("message_id")
 
 
 # --- YouTube ------------------------------------------------------------------
@@ -597,6 +648,358 @@ class YouTube(DeviceFlowAccount):
             return
 
 
+# --- YouTube chat ---------------------------------------------------------------
+
+def _python_exe():
+    """The real python.exe. Inside OBS, sys.executable is obs64.exe."""
+    for base in (sys.base_prefix, sys.exec_prefix, sys.prefix):
+        exe = os.path.join(base or "", "python.exe")
+        if base and os.path.isfile(exe):
+            return exe
+    return None
+
+
+_YT_KINDS = {
+    "textmessageevent": "text",
+    "superchatevent": "superchat",
+    "superstickerevent": "supersticker",
+    "newsponsorevent": "member",
+    "membermilestonechatevent": "member",
+    "membershipgiftingevent": "gift",
+    "giftmembershipreceivedevent": "gift",
+    "giftevent": "gift",
+    "tombstone": "delete",
+    "messagedeletedevent": "delete",
+    "userbannedevent": "ban",
+    "chatendedevent": "system",
+}
+
+
+def _normalize_yt(item):
+    """streamList item (gRPC, camelCase) -> message dict for the dock."""
+    s = item.get("snippet", {})
+    a = item.get("authorDetails", {})
+    kind = _YT_KINDS.get((s.get("type") or "").replace("_", "").lower())
+    if kind is None:
+        return None  # polls etc. are not shown
+    msg = {
+        "platform": "youtube",
+        "id": item.get("id"),
+        "kind": kind,
+        "ts": s.get("publishedAt"),
+        "author": a.get("displayName") or "",
+        "author_id": a.get("channelId") or s.get("authorChannelId"),
+        "owner": bool(a.get("isChatOwner")),
+        "mod": bool(a.get("isChatModerator")),
+        "member": bool(a.get("isChatSponsor")),
+        "verified": bool(a.get("isVerified")),
+        "text": (s.get("textMessageDetails") or {}).get("messageText") or s.get("displayMessage") or "",
+    }
+    if kind == "superchat":
+        d = s.get("superChatDetails") or {}
+        msg["amount"] = d.get("amountDisplayString")
+        msg["text"] = d.get("userComment") or ""
+    elif kind == "supersticker":
+        msg["amount"] = (s.get("superStickerDetails") or {}).get("amountDisplayString")
+    elif kind == "delete":
+        msg["target"] = (s.get("messageDeletedDetails") or {}).get("deletedMessageId") or item.get("id")
+    elif kind == "ban":
+        msg["target_author_id"] = ((s.get("userBannedDetails") or {}).get("bannedUserDetails") or {}).get("channelId")
+    return msg
+
+
+class YouTubeChat:
+    """Keeps the helper process running while there is a live chat to read.
+
+    States: idle, searching (looking for the live broadcast), connected,
+    retrying, ended, error.
+    """
+
+    def __init__(self, yt):
+        self.yt = yt
+        self.lock = threading.Lock()
+        self.messages = deque(maxlen=CHAT_BUFFER)  # (seq, msg)
+        self.seen = deque(maxlen=2000)
+        self.seq = 0
+        self.state = {"state": "idle"}
+        self.live_chat_id = None
+        self.page_token = None
+        self.ended_chats = set()  # chats YouTube reported as offline, never reconnect to them
+        self.want = False
+        self.thread = None
+        self.proc = None
+
+    def public_state(self):
+        with self.lock:
+            return dict(self.state)
+
+    def _set(self, state, **extra):
+        with self.lock:
+            self.state = {"state": state, "at": time.time(), **extra}
+
+    def since(self, seq):
+        with self.lock:
+            return self.seq, [m for s, m in self.messages if s > seq]
+
+    def _add(self, items):
+        with self.lock:
+            for it in items:
+                msg = _normalize_yt(it)
+                if msg is None:
+                    continue
+                key = (msg["kind"], msg["id"])
+                if key in self.seen:
+                    continue
+                self.seen.append(key)
+                self.seq += 1
+                self.messages.append((self.seq, msg))
+
+    def start(self):
+        with self.lock:
+            self.want = True
+            if self.thread is not None and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._run, name="obs-stream-dock-ytchat", daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            self.want = False
+            proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def _wait(self, seconds):
+        """Sleep, but wake up early on unload or stop. Returns False if we should quit."""
+        end = time.time() + seconds
+        while time.time() < end:
+            if _stop.wait(min(1.0, end - time.time())) or not self.want:
+                return False
+        return True
+
+    def _find_chat(self):
+        started = time.time()
+        while self.want and not _stop.is_set():
+            self._set("searching")
+            try:
+                active = self.yt.list_broadcasts("active")
+            except ApiError as e:
+                self._set("error", error=e.message)
+                return None
+            for b in active:
+                chat_id = b["snippet"].get("liveChatId")
+                if chat_id and chat_id not in self.ended_chats:
+                    return chat_id
+            # Nothing live. Keep looking only while OBS streams (the YouTube
+            # output may start a little later), never forever.
+            if not _streaming.is_set() or time.time() - started > CHAT_FIND_MAX_S:
+                self._set("idle", note="No live YouTube broadcast")
+                return None
+            if not self._wait(CHAT_FIND_POLL_S):
+                return None
+        return None
+
+    def _run(self):
+        failures = 0
+        try:
+            while self.want and not _stop.is_set():
+                if not self.yt.tokens:
+                    self._set("error", error="Not logged in to YouTube")
+                    return
+                python = _python_exe()
+                if python is None:
+                    self._set("error", error="python.exe not found next to the OBS Python runtime")
+                    return
+                if not self.live_chat_id:
+                    self.live_chat_id = self._find_chat()
+                    self.page_token = None
+                    if not self.live_chat_id:
+                        return
+                try:
+                    token = self.yt.access_token()
+                except ApiError as e:
+                    self._set("error", error=e.message)
+                    return
+                result = self._run_helper(python, token)
+                if not self.want or _stop.is_set():
+                    return
+                kind, code = result.get("type"), result.get("code")
+                if result.get("offline"):
+                    self._set("ended", note="The broadcast has ended")
+                    self.ended_chats.add(self.live_chat_id)
+                    self.live_chat_id = None
+                    if not _streaming.is_set():
+                        return
+                    continue  # OBS still streams: look for the next broadcast
+                if kind == "error" and code == "UNAUTHENTICATED":
+                    try:
+                        self.yt.access_token(force_refresh=True)
+                    except ApiError as e:
+                        self._set("error", error=e.message)
+                        return
+                    continue
+                if kind == "error" and code in ("NOT_FOUND", "FAILED_PRECONDITION", "PERMISSION_DENIED", "INVALID_ARGUMENT"):
+                    # Chat is gone or not accessible: look for the broadcast again.
+                    self.live_chat_id = None
+                failures = failures + 1 if kind != "page-end" else 0
+                wait = min(CHAT_RETRY_MAX_S, 10 * (2 ** min(failures, 5)))
+                self._set("retrying", error=result.get("message") or code or "connection closed", retry_in=wait)
+                _log(obs.LOG_INFO, f"YouTube chat: {code or kind}, reconnecting in {wait} s")
+                if not self._wait(wait):
+                    return
+        finally:
+            with self.lock:
+                self.proc = None
+                if self.state.get("state") in ("connected", "searching", "retrying"):
+                    self.state = {"state": "idle", "at": time.time()}
+
+    def _run_helper(self, python, token):
+        """Run one helper process until it exits. Returns the last event."""
+        try:
+            proc = subprocess.Popen(
+                [python, "-E", "-s", CHAT_HELPER],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as e:
+            return {"type": "error", "code": "SPAWN", "message": str(e)}
+        with self.lock:
+            self.proc = proc
+        last = {"type": "end"}
+        got_page = False
+        try:
+            proc.stdin.write(json.dumps({"token": token, "live_chat_id": self.live_chat_id,
+                                         "page_token": self.page_token}) + "\n")
+            proc.stdin.flush()  # keep stdin open: closing it tells the helper to quit
+            for line in proc.stdout:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    _log(obs.LOG_WARNING, f"YouTube chat helper: {line.rstrip()[:300]}")
+                    continue
+                if ev.get("type") == "page":
+                    if not got_page:
+                        got_page = True
+                        self._set("connected")
+                    if ev.get("nextPageToken"):
+                        self.page_token = ev["nextPageToken"]
+                    self._add(ev.get("items") or [])
+                    if ev.get("offlineAt"):
+                        last = {"type": "end", "offline": True}
+                        break
+                else:
+                    last = ev
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
+        if got_page and last.get("type") == "end" and not last.get("offline"):
+            last = {"type": "page-end"}  # stream closed normally after working: reconnect soon
+        return last
+
+
+def _youtube_send_chat(text):
+    chat_id = _ytchat.live_chat_id if _ytchat else None
+    if not chat_id:
+        for b in _youtube.list_broadcasts("active"):
+            chat_id = b["snippet"].get("liveChatId")
+            if chat_id:
+                break
+    if not chat_id:
+        raise ApiError(409, "YouTube: no live broadcast with chat right now")
+    body = _youtube.api("POST", "/liveChat/messages", {"part": "snippet"}, json_body={
+        "snippet": {"liveChatId": chat_id, "type": "textMessageEvent",
+                    "textMessageDetails": {"messageText": text}}})
+    return (body or {}).get("id")
+
+
+# --- third-party emotes (7TV, BTTV, FFZ) -------------------------------------------
+
+def _fetch_emotes(twitch_id):
+    """name -> image URL. Global sets first, channel sets override them."""
+    out = {}
+
+    def get(url):
+        try:
+            status, body = _http("GET", url, timeout=8)
+            return body if status == 200 else None
+        except ApiError:
+            return None
+
+    def add_7tv(emotes):
+        for e in emotes or []:
+            host = ((e.get("data") or {}).get("host") or {}).get("url")
+            if e.get("name") and host:
+                out[e["name"]] = f"https:{host}/1x.webp" if host.startswith("//") else f"{host}/1x.webp"
+
+    def add_bttv(emotes):
+        for e in emotes or []:
+            if e.get("code") and e.get("id"):
+                out[e["code"]] = f"https://cdn.betterttv.net/emote/{e['id']}/1x"
+
+    def add_ffz(emoticons):
+        for e in emoticons or []:
+            url = (e.get("urls") or {}).get("1")
+            if e.get("name") and url:
+                out[e["name"]] = url
+
+    g = get("https://api.frankerfacez.com/v1/set/global")
+    if g:
+        for sid in g.get("default_sets", []):
+            add_ffz((g.get("sets", {}).get(str(sid)) or {}).get("emoticons"))
+    add_bttv(get("https://api.betterttv.net/3/cached/emotes/global"))
+    add_7tv((get("https://7tv.io/v3/emote-sets/global") or {}).get("emotes"))
+    if twitch_id:
+        f = get(f"https://api.frankerfacez.com/v1/room/id/{twitch_id}")
+        if f and f.get("room"):
+            add_ffz((f.get("sets", {}).get(str(f["room"].get("set"))) or {}).get("emoticons"))
+        b = get(f"https://api.betterttv.net/3/cached/users/twitch/{twitch_id}") or {}
+        add_bttv(b.get("sharedEmotes"))
+        add_bttv(b.get("channelEmotes"))
+        add_7tv(((get(f"https://7tv.io/v3/users/twitch/{twitch_id}") or {}).get("emote_set") or {}).get("emotes"))
+    return out
+
+
+def _get_emotes():
+    with _emotes["lock"]:
+        if _emotes["data"] is None or time.time() - _emotes["at"] > EMOTE_CACHE_S:
+            ident = _twitch.chat_identity() if _twitch else None
+            _emotes["data"] = _fetch_emotes(ident["user_id"] if ident else None)
+            _emotes["at"] = time.time()
+        return _emotes["data"]
+
+
+def _send_chat(text, targets):
+    text = (text or "").strip()
+    if not text:
+        raise ApiError(400, "Message is empty")
+    results = {}
+    for target in targets:
+        try:
+            if target == "twitch":
+                if len(text) > TWITCH_CHAT_MAX:
+                    raise ApiError(400, f"Twitch allows {TWITCH_CHAT_MAX} characters")
+                _twitch.send_chat(text)
+            elif target == "youtube":
+                if len(text) > YOUTUBE_CHAT_MAX:
+                    raise ApiError(400, f"YouTube allows {YOUTUBE_CHAT_MAX} characters")
+                _youtube_send_chat(text)
+            else:
+                continue
+            results[target] = {"ok": True}
+        except ApiError as e:
+            results[target] = {"ok": False, "error": e.message}
+    return results
+
+
 # --- HTTP server ----------------------------------------------------------------
 
 class _ExclusiveServer(ThreadingHTTPServer):
@@ -655,7 +1058,22 @@ class _Handler(SimpleHTTPRequestHandler):
                         "streaming": _streaming.is_set(),
                         "twitch": tw.public_state(),
                         "youtube": yt.public_state(),
+                        "youtube_chat": _ytchat.public_state(),
                     })
+                if path == "/api/chat/config":
+                    return self._send_json(200, {
+                        "ok": True,
+                        "twitch": tw.chat_identity(),
+                        "youtube": {"logged_in": bool(yt.tokens)},
+                        "limits": {"twitch": TWITCH_CHAT_MAX, "youtube": YOUTUBE_CHAT_MAX},
+                    })
+                if path == "/api/chat/emotes":
+                    return self._send_json(200, {"ok": True, "emotes": _get_emotes()})
+                if path == "/api/chat/youtube":
+                    since = int((query.get("since") or ["0"])[0] or 0)
+                    seq, msgs = _ytchat.since(since)
+                    return self._send_json(200, {"ok": True, "seq": seq, "messages": msgs,
+                                                 "state": _ytchat.public_state()})
                 if path == "/api/twitch/channel":
                     return self._send_json(200, {"ok": True, **tw.get_channel()})
                 if path == "/api/twitch/categories":
@@ -680,6 +1098,19 @@ class _Handler(SimpleHTTPRequestHandler):
                 if path == "/api/youtube/pending/clear":
                     yt.clear_pending()
                     return self._send_json(200, {"ok": True})
+                if path == "/api/chat/youtube/connect":
+                    if not yt.tokens:
+                        raise ApiError(401, "Not logged in to YouTube")
+                    _ytchat.start()
+                    return self._send_json(200, {"ok": True})
+                if path == "/api/chat/youtube/disconnect":
+                    _ytchat.stop()
+                    return self._send_json(200, {"ok": True})
+                if path == "/api/chat/send":
+                    targets = [t for t in (body.get("targets") or []) if t in ("twitch", "youtube")]
+                    if not targets:
+                        raise ApiError(400, "No platform selected")
+                    return self._send_json(200, {"ok": True, "results": _send_chat(body.get("text"), targets)})
             return self._send_json(404, {"ok": False, "error": "Not found"})
         except ApiError as e:
             status = e.status if 400 <= e.status < 600 else 502
@@ -754,6 +1185,8 @@ def _on_frontend_event(event):
         _streaming.set()
         if _youtube is not None:
             _youtube.ensure_watcher()
+            if _youtube.tokens and _ytchat is not None:
+                _ytchat.start()  # reads the chat as soon as the broadcast is live
     elif event == obs.OBS_FRONTEND_EVENT_STREAMING_STOPPED:
         _streaming.clear()
 
@@ -761,13 +1194,14 @@ def _on_frontend_event(event):
 def script_description():
     return (
         "<b>OBS Stream Dock</b><br>"
-        "Set title and category for Twitch and YouTube from a dock.<br>"
-        f"Add <code>http://{HOST}:{PORT}/</code> via Docks → Custom Browser Docks."
+        "Title, category and a combined chat for Twitch and YouTube.<br>"
+        f"Docks → Custom Browser Docks: <code>http://{HOST}:{PORT}/</code> (stream info) "
+        f"and <code>http://{HOST}:{PORT}/chat.html</code> (chat)."
     )
 
 
 def script_load(settings):
-    global _twitch, _youtube
+    global _twitch, _youtube, _ytchat
     _stop.clear()
     cfg = _read_json(CONFIG_PATH) or {}
     twitch_id = (cfg.get("twitch_client_id") or "").strip()
@@ -779,6 +1213,7 @@ def script_load(settings):
         _log(obs.LOG_WARNING, "No google_client_id/secret in config.local.json, YouTube is disabled")
     _twitch = Twitch(twitch_id)
     _youtube = YouTube(google_id, google_secret)
+    _ytchat = YouTubeChat(_youtube)
 
     if obs.obs_frontend_streaming_active():
         _streaming.set()
@@ -786,9 +1221,13 @@ def script_load(settings):
         _streaming.clear()
     obs.obs_frontend_add_event_callback(_on_frontend_event)
     _youtube.ensure_watcher()  # resume a title left pending before a reload
+    if _streaming.is_set() and _youtube.tokens:
+        _ytchat.start()
     _start_server()
 
 
 def script_unload():
     _stop.set()
+    if _ytchat is not None:
+        _ytchat.stop()  # kills the helper process
     _stop_server()

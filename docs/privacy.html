@@ -10,7 +10,7 @@
 <main>
   <p class="small"><a href="./">← OBS Stream Dock</a></p>
   <h1>Privacy Policy</h1>
-  <p class="small">Last updated: October 24, 2026</p>
+  <p class="small">Last updated: October 24, 2026 (combined chat added)</p>
 
   <p>OBS Stream Dock ("the plugin") is an open-source script for OBS Studio. It runs entirely on your own computer.
      The author does not operate any server for it and does not receive, collect or store any of your data.</p>
@@ -18,23 +18,30 @@
   <h2>What the plugin accesses</h2>
   <p>When you log in, you grant the plugin access to your accounts through the official login pages of Twitch and Google:</p>
   <ul>
-    <li><strong>Twitch</strong> (scope <code>channel:manage:broadcast</code>): your user name and ID, your channel's current title and category,
-        and the permission to change title and category. It also searches Twitch categories when you type in the category field.</li>
+    <li><strong>Twitch</strong> (scopes <code>channel:manage:broadcast</code> and <code>user:write:chat</code>): your user name and ID, your channel's current title and category,
+        the permission to change title and category, and the permission to send chat messages in your name when you use the chat dock.
+        It also searches Twitch categories when you type in the category field. Your channel's public chat is read anonymously, without your login.</li>
     <li><strong>YouTube</strong> (scope <code>https://www.googleapis.com/auth/youtube</code>): your channel name and ID,
-        your live broadcasts (title, description, status, scheduled time), and the permission to change the title and description of these broadcasts.</li>
+        your live broadcasts (title, description, status, scheduled time), the permission to change the title and description of these broadcasts,
+        the live chat of your current broadcast (messages, author names and channel IDs, Super Chats and similar events), and the permission to send chat messages in your name when you use the chat dock.</li>
   </ul>
   <p>The plugin only uses this access to show and update your stream title, category and description when you click <em>Apply</em>,
-     and to apply a pending title to your YouTube broadcast once it is live. It does not read or change anything else.</p>
+     to apply a pending title to your YouTube broadcast once it is live, to show your live chat in the chat dock, and to send the chat messages you type there.
+     It does not read or change anything else. Chat messages are only kept in memory while OBS runs; they are not written to disk.</p>
+
+  <h2>Emote services</h2>
+  <p>To show custom emotes in the chat dock, the plugin requests the emote lists of your channel from 7TV, BetterTTV and FrankerFaceZ, using your public Twitch channel ID,
+     and loads the emote images from their servers and from Twitch. These requests go directly from your computer to those services and are subject to their privacy policies.</p>
 
   <h2>Where your data is stored</h2>
   <ul>
     <li>Login tokens and a pending YouTube title are stored in plain files in the plugin's <code>data</code> folder on your computer.</li>
-    <li>Nothing is sent anywhere except directly from your computer to the Twitch and Google/YouTube APIs.</li>
+    <li>Nothing is sent anywhere except directly from your computer to the Twitch and Google/YouTube APIs and, for emotes, to 7TV, BetterTTV and FrankerFaceZ.</li>
     <li>The plugin contains no analytics, tracking or telemetry.</li>
   </ul>
 
   <h2>Sharing</h2>
-  <p>Your data is not sold, shared with or transferred to anyone. It never leaves your computer except for the API requests to Twitch and Google described above.</p>
+  <p>Your data is not sold, shared with or transferred to anyone. It never leaves your computer except for the requests to Twitch, Google and the emote services described above.</p>
 
   <h2>Google API Services</h2>
   <p>The plugin's use and transfer of information received from Google APIs adheres to the

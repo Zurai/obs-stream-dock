@@ -58,6 +58,46 @@ summary { cursor: pointer; font-weight: 600; }
 #diag { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 6px;
         font-size: 11px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto; }
 
+/* ---- chat dock ---- */
+body.chat-page { display: flex; flex-direction: column; height: 100vh; padding: 0; overflow: hidden; }
+#chat-status { display: flex; gap: 14px; padding: 5px 10px; border-bottom: 1px solid var(--border); font-size: 11px; flex: none; }
+#chat-status .stat { display: flex; align-items: center; gap: 5px; }
+#feed { flex: 1; overflow-y: auto; padding: 4px 10px; line-height: 1.45; word-wrap: break-word; }
+.msg { padding: 2px 0; }
+.msg.deleted { opacity: .35; text-decoration: line-through; }
+.msg.system, .msg.notice { color: var(--muted); font-style: italic; }
+.msg.superchat, .msg.supersticker { background: rgba(249, 226, 175, .12); border-left: 3px solid #f9e2af; padding-left: 6px; }
+.msg.member, .msg.gift { background: rgba(166, 227, 161, .10); border-left: 3px solid var(--ok); padding-left: 6px; }
+.plat { display: inline-block; min-width: 18px; padding: 0 3px; margin-right: 4px; border-radius: 3px; font-size: 9px;
+        font-weight: 700; text-align: center; color: #fff; vertical-align: 1px; }
+.plat.twitch { background: #9147ff; }
+.plat.youtube { background: #e62117; }
+.badge { font-size: 9px; font-weight: 700; padding: 0 3px; margin-right: 3px; border-radius: 3px; vertical-align: 1px;
+         background: var(--border); color: var(--text); }
+.badge.owner { background: #f9e2af; color: #1e1e2e; }
+.badge.mod { background: #a6e3a1; color: #1e1e2e; }
+.amount { font-weight: 700; color: #f9e2af; margin-right: 5px; }
+.notice { margin-right: 5px; }
+.name { font-weight: 700; color: #cba6f7; }
+.msg.youtube .name { color: #f5c2e7; }
+.text.action { font-style: italic; }
+.emote { height: 24px; vertical-align: middle; margin: -3px 1px; }
+#more { position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #fff;
+        font-size: 11px; padding: 3px 10px; border-radius: 10px; }
+#send { flex: none; border-top: 1px solid var(--border); padding: 6px 8px; }
+#send-error { font-size: 11px; margin-bottom: 4px; }
+.send-row { display: flex; align-items: center; gap: 5px; }
+.send-row #text { flex: 1; }
+.send-row #count { font-size: 10px; min-width: 38px; text-align: right; }
+.target { cursor: pointer; user-select: none; }
+.target input { display: none; }
+.target span { display: inline-block; padding: 4px 6px; border-radius: 4px; font-size: 10px; font-weight: 700;
+               color: #fff; opacity: .3; }
+.target.twitch span { background: #9147ff; }
+.target.youtube span { background: #e62117; }
+.target input:checked + span { opacity: 1; }
+.target input:disabled + span { opacity: .12; cursor: not-allowed; }
+
 footer { margin-top: 14px; padding-top: 6px; border-top: 1px solid var(--border);
          display: flex; gap: 10px; font-size: 11px; }
 footer #diag-link { margin-left: auto; }
