@@ -925,25 +925,46 @@ def _youtube_send_chat(text):
 
 def _fetch_emotes(twitch_id):
     """Returns (name -> image URL, complete). Global sets first, channel sets override them."""
-    out = {}
     failed = []
 
     def get(url):
         # One retry: a single hiccup must not leave a whole emote service out.
+        # FrankerFaceZ in particular sometimes doesn't answer for a while.
         for attempt in (1, 2):
             try:
-                status, body = _http("GET", url, timeout=8)
+                status, body = _http("GET", url, timeout=12)
             except ApiError as e:
                 status, body = 0, e.message
             if status == 200:
                 return body
-            # 404 means the channel simply has no emotes on that service.
-            if status == 404:
+            if status == 404:  # the channel simply has no emotes on that service
                 return None
             if attempt == 2:
                 failed.append(url.split("/")[2])
                 _log(obs.LOG_WARNING, f"Emotes: {url} failed ({status or body})")
         return None
+
+    urls = {
+        "ffz_global": "https://api.frankerfacez.com/v1/set/global",
+        "bttv_global": "https://api.betterttv.net/3/cached/emotes/global",
+        "7tv_global": "https://7tv.io/v3/emote-sets/global",
+    }
+    if twitch_id:
+        urls.update({
+            "ffz_channel": f"https://api.frankerfacez.com/v1/room/id/{twitch_id}",
+            "bttv_channel": f"https://api.betterttv.net/3/cached/users/twitch/{twitch_id}",
+            "7tv_channel": f"https://7tv.io/v3/users/twitch/{twitch_id}",
+        })
+    # Fetch in parallel so one slow service doesn't hold up the others.
+    results = {}
+    threads = [threading.Thread(target=lambda k=k, u=u: results.__setitem__(k, get(u)), daemon=True)
+               for k, u in urls.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+
+    out = {}
 
     def add_7tv(emotes):
         for e in emotes or []:
@@ -962,20 +983,18 @@ def _fetch_emotes(twitch_id):
             if e.get("name") and url:
                 out[e["name"]] = url
 
-    g = get("https://api.frankerfacez.com/v1/set/global")
-    if g:
-        for sid in g.get("default_sets", []):
-            add_ffz((g.get("sets", {}).get(str(sid)) or {}).get("emoticons"))
-    add_bttv(get("https://api.betterttv.net/3/cached/emotes/global"))
-    add_7tv((get("https://7tv.io/v3/emote-sets/global") or {}).get("emotes"))
-    if twitch_id:
-        f = get(f"https://api.frankerfacez.com/v1/room/id/{twitch_id}")
-        if f and f.get("room"):
-            add_ffz((f.get("sets", {}).get(str(f["room"].get("set"))) or {}).get("emoticons"))
-        b = get(f"https://api.betterttv.net/3/cached/users/twitch/{twitch_id}") or {}
-        add_bttv(b.get("sharedEmotes"))
-        add_bttv(b.get("channelEmotes"))
-        add_7tv(((get(f"https://7tv.io/v3/users/twitch/{twitch_id}") or {}).get("emote_set") or {}).get("emotes"))
+    g = results.get("ffz_global") or {}
+    for sid in g.get("default_sets", []):
+        add_ffz((g.get("sets", {}).get(str(sid)) or {}).get("emoticons"))
+    add_bttv(results.get("bttv_global"))
+    add_7tv((results.get("7tv_global") or {}).get("emotes"))
+    f = results.get("ffz_channel") or {}
+    if f.get("room"):
+        add_ffz((f.get("sets", {}).get(str(f["room"].get("set"))) or {}).get("emoticons"))
+    b = results.get("bttv_channel") or {}
+    add_bttv(b.get("sharedEmotes"))
+    add_bttv(b.get("channelEmotes"))
+    add_7tv(((results.get("7tv_channel") or {}).get("emote_set") or {}).get("emotes"))
     return out, not failed
 
 
@@ -987,7 +1006,7 @@ def _get_emotes():
             ident = _twitch.chat_identity() if _twitch else None
             _emotes["data"], _emotes["complete"] = _fetch_emotes(ident["user_id"] if ident else None)
             _emotes["at"] = time.time()
-        return _emotes["data"]
+        return _emotes["data"], _emotes["complete"]
 
 
 def _send_chat(text, targets):
@@ -1081,7 +1100,8 @@ class _Handler(SimpleHTTPRequestHandler):
                         "limits": {"twitch": TWITCH_CHAT_MAX, "youtube": YOUTUBE_CHAT_MAX},
                     })
                 if path == "/api/chat/emotes":
-                    return self._send_json(200, {"ok": True, "emotes": _get_emotes()})
+                    emotes, complete = _get_emotes()
+                    return self._send_json(200, {"ok": True, "emotes": emotes, "complete": complete})
                 if path == "/api/chat/youtube":
                     since = int((query.get("since") or ["0"])[0] or 0)
                     seq, msgs = _ytchat.since(since)

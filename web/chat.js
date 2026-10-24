@@ -356,8 +356,14 @@ $('text').addEventListener('keydown', ev => {
 
 // ---- start -------------------------------------------------------------------
 
+let emoteRetry = null;
 function loadEmotes() {
-  api('GET', '/api/chat/emotes').then(r => { emotes = r.emotes || {}; }).catch(() => {});
+  clearTimeout(emoteRetry);
+  api('GET', '/api/chat/emotes').then(r => {
+    emotes = r.emotes || {};
+    // A service didn't answer: the plugin retries after a minute, so ask again then.
+    if (!r.complete) emoteRetry = setTimeout(loadEmotes, 65 * 1000);
+  }).catch(() => { emoteRetry = setTimeout(loadEmotes, 65 * 1000); });
 }
 
 async function start() {
