@@ -1,0 +1,24 @@
+# --- Secrets & local state: NEVER commit ---
+tokens.json
+*.token
+secrets.*
+.env
+.env.*
+config.local.*
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs & OS clutter
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
