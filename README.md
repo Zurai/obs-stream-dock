@@ -2,48 +2,54 @@
 
 Set your stream **title and category on Twitch and YouTube at once**, right from a dock inside OBS Studio. No browser dashboards, no extra apps, no context switching.
 
-> **Status:** early development, nothing usable yet.
+> **Status:** early development. Twitch works, YouTube is being tested.
+
+Project page: [zurai.github.io/obs-stream-info](https://zurai.github.io/obs-stream-info/) · [Privacy policy](https://zurai.github.io/obs-stream-info/privacy.html)
 
 ## Why
 
 When you simulcast to Twitch and YouTube, updating the stream title means editing it in two dashboards. Existing all-in-one tools either moved this feature behind a subscription or route your stream through their servers. This project keeps everything local and inside OBS.
 
-## How it works (planned)
+## How it works
 
 - An **OBS Python script** starts a small local web server when OBS loads, and stops it when OBS closes.
-- The UI is a **Custom Browser Dock** pointing to `http://localhost:<port>`.
+- The UI is a **Custom Browser Dock** pointing to `http://127.0.0.1:47823/`.
 - One-time login to Twitch and Google via **device code flow**. Tokens are stored locally and refresh automatically.
-- **Apply** updates both platforms and shows a per-platform result (✓ or the error).
+- **Apply** updates both platforms and shows a per-platform result (✓, ✗ or ⏳ pending).
 
 ### Twitch
 - Title and category via `PATCH /helix/channels` (scope `channel:manage:broadcast`)
 - Category search with autocomplete via `/helix/search/categories`
 
 ### YouTube
-- Title and description of the active or upcoming broadcast via `liveBroadcasts.update`
+- Title and optional description of the live or upcoming broadcast via `liveBroadcasts.update` (falls back to `videos.update`)
+- If no broadcast exists yet, the title is kept and applied automatically once the broadcast is live (checked every 30 s while OBS is streaming)
 - Works with a separate YouTube output, for example from a multistream plugin
+- YouTube's API has no game field; titles are limited to 100 characters
 
-## Requirements (planned)
+## Requirements
 
 - OBS Studio 32+ on Windows
-- Python 3 (64-bit, version matching your OBS build) configured under *Tools → Scripts → Python Settings*
-- Your own Twitch application (public client) and Google Cloud project with the YouTube Data API v3 enabled
+- 64-bit Python 3.12 (OBS supports 3.6–3.12)
+- Your own Twitch application and Google Cloud project (see below)
 
-## Setup (current state: Twitch only)
+## Setup
 
 1. Install 64-bit Python 3.12 and select its folder in OBS under *Tools → Scripts → Python Settings*.
-2. Register an application in the [Twitch Developer Console](https://dev.twitch.tv/console) (client type **Public**, any redirect URL such as `http://localhost`). Copy its client ID.
-3. Copy `config.example.json` to `config.local.json` next to the script and paste your client ID. This file is ignored by git.
-4. In OBS, add `obs_stream_info.py` under *Tools → Scripts*.
-5. Add a dock under *Docks → Custom Browser Docks* with the URL `http://127.0.0.1:47823/`.
-6. Click **Log in with Twitch** in the dock and confirm the code in your browser.
+2. **Twitch:** register an application in the [Twitch Developer Console](https://dev.twitch.tv/console) (client type **Public**, redirect URL `http://localhost`). Copy its client ID.
+3. **YouTube:** in the [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **YouTube Data API v3**, set up the Google Auth Platform (audience *External*, add yourself as a test user or publish the app) and create an OAuth client of type **TVs and Limited Input devices**. Copy client ID and client secret.
+   - While the app is in *Testing* mode, Google expires the login after 7 days.
+4. Copy `config.example.json` to `config.local.json` next to the script and fill in the IDs and the secret. This file is ignored by git.
+5. In OBS, add `obs_stream_info.py` under *Tools → Scripts*.
+6. Add a dock under *Docks → Custom Browser Docks* with the URL `http://127.0.0.1:47823/`.
+7. Log in with Twitch and YouTube in the dock and confirm the codes in your browser.
 
 Tokens are stored in `data/` next to the script, which is also ignored by git.
 
 ## Roadmap
 
-1. Feasibility: OBS Python script serving a browser dock reliably
-2. Twitch: login, title, category search
+1. ~~Feasibility: OBS Python script serving a browser dock reliably~~
+2. ~~Twitch: login, title, category search~~
 3. YouTube: login, title, timing around stream start
 4. Polish: title templates, theming, optional chat with 7TV/BTTV/FFZ emotes
 

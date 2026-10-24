@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OBS Stream Info</title>
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<main>
+  <h1>OBS Stream Info</h1>
+  <p class="lead">Set your stream <strong>title and category on Twitch and YouTube at once</strong>, right from a dock inside OBS Studio.</p>
+
+  <h2>What it does</h2>
+  <ul>
+    <li>Adds a dock to OBS with fields for title, Twitch category and an optional YouTube description.</li>
+    <li>One click on <em>Apply</em> updates Twitch and YouTube and shows the result for each platform.</li>
+    <li>If your YouTube broadcast doesn't exist yet, the title is kept and applied as soon as you go live.</li>
+    <li>Everything runs locally inside OBS. There is no server operated by the author and no account to create.</li>
+  </ul>
+
+  <h2>How it works</h2>
+  <p>An OBS Python script starts a small web server on <code>127.0.0.1</code> while OBS is running. The dock is a Custom Browser Dock pointing to it.
+     You log in once to Twitch and Google with a device code; the plugin then talks directly from your PC to the Twitch and YouTube APIs.</p>
+
+  <h2>Get it</h2>
+  <p>Source code, setup guide and issue tracker: <a href="https://github.com/Zurai/obs-stream-info">github.com/Zurai/obs-stream-info</a></p>
+
+  <p class="small"><a href="privacy.html">Privacy policy</a> · MIT License</p>
+</main>
+</body>
+</html>

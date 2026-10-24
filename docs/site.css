@@ -1,0 +1,8 @@
+body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; margin: 0; line-height: 1.55; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 20px 48px; }
+h1 { color: #fff; margin-bottom: 4px; }
+h2 { color: #fff; margin-top: 28px; font-size: 1.15em; }
+a { color: #a970ff; }
+code { background: #282838; padding: 1px 5px; border-radius: 3px; font-size: .92em; }
+.lead { font-size: 1.1em; }
+.small { font-size: .88em; color: #8b8fa8; }
