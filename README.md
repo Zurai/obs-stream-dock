@@ -29,6 +29,17 @@ When you simulcast to Twitch and YouTube, updating the stream title means editin
 - Python 3 (64-bit, version matching your OBS build) configured under *Tools → Scripts → Python Settings*
 - Your own Twitch application (public client) and Google Cloud project with the YouTube Data API v3 enabled
 
+## Setup (current state: Twitch only)
+
+1. Install 64-bit Python 3.12 and select its folder in OBS under *Tools → Scripts → Python Settings*.
+2. Register an application in the [Twitch Developer Console](https://dev.twitch.tv/console) (client type **Public**, any redirect URL such as `http://localhost`). Copy its client ID.
+3. Copy `config.example.json` to `config.local.json` next to the script and paste your client ID. This file is ignored by git.
+4. In OBS, add `obs_stream_info.py` under *Tools → Scripts*.
+5. Add a dock under *Docks → Custom Browser Docks* with the URL `http://127.0.0.1:47823/`.
+6. Click **Log in with Twitch** in the dock and confirm the code in your browser.
+
+Tokens are stored in `data/` next to the script, which is also ignored by git.
+
 ## Roadmap
 
 1. Feasibility: OBS Python script serving a browser dock reliably

@@ -3,40 +3,47 @@
 <head>
 <meta charset="utf-8">
 <title>Stream Info</title>
-<style>
-  body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; margin: 12px; font-size: 14px; }
-  h1 { font-size: 16px; margin: 0 0 8px; }
-  #state { font-weight: bold; }
-  .ok { color: #a6e3a1; } .err { color: #f38ba8; }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 8px 0 0; }
-  dt { opacity: .7; }
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>Hello from OBS Stream Info 👋</h1>
-  <div>Server: <span id="state">…</span></div>
-  <dl>
-    <dt>PID</dt><dd id="pid">–</dd>
-    <dt>Uptime</dt><dd id="uptime">–</dd>
-    <dt>Loads</dt><dd id="loads">–</dd>
-    <dt>Threads</dt><dd id="threads">–</dd>
-  </dl>
-<script>
-  const $ = id => document.getElementById(id);
-  async function poll() {
-    try {
-      const r = await fetch('/api/status', { cache: 'no-store' });
-      const s = await r.json();
-      $('state').textContent = 'online'; $('state').className = 'ok';
-      $('pid').textContent = s.pid;
-      $('uptime').textContent = s.uptime_s + ' s';
-      $('loads').textContent = s.load_count;
-      $('threads').textContent = s.threads;
-    } catch (e) {
-      $('state').textContent = 'offline'; $('state').className = 'err';
-    }
-  }
-  poll(); setInterval(poll, 2000);
-</script>
+  <section id="login" hidden>
+    <p id="login-text">Connect your Twitch account to set title and category from here.</p>
+    <button id="login-btn" class="primary">Log in with Twitch</button>
+    <div id="login-pending" hidden>
+      <p>A browser window should have opened. If not, go to<br>
+        <a id="login-link" href="#" target="_blank"></a><br>and enter this code:</p>
+      <div id="login-code" class="code"></div>
+      <p class="muted">Waiting for confirmation …</p>
+    </div>
+    <p id="login-error" class="err" hidden></p>
+  </section>
+
+  <section id="not-configured" hidden>
+    <p class="err">No Twitch client ID configured.</p>
+    <p class="muted">Create <code>config.local.json</code> next to the script (see README), then reload the script.</p>
+  </section>
+
+  <form id="form" hidden autocomplete="off">
+    <label for="title">Title <span id="title-count" class="muted"></span></label>
+    <input id="title" maxlength="140" placeholder="Stream title">
+
+    <label for="category">Category</label>
+    <div class="combo">
+      <img id="category-art" alt="">
+      <input id="category" placeholder="Search Twitch categories">
+      <ul id="suggestions" hidden></ul>
+    </div>
+
+    <button id="apply" class="primary" type="submit">Apply</button>
+    <ul id="results"></ul>
+  </form>
+
+  <footer>
+    <span id="server" class="muted">…</span>
+    <span id="account" class="muted"></span>
+    <a id="logout" href="#" hidden>log out</a>
+  </footer>
+
+<script src="app.js"></script>
 </body>
 </html>
