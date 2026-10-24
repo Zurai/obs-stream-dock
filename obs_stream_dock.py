@@ -79,7 +79,7 @@ _streaming = threading.Event()  # mirrors the OBS main stream state
 _twitch = None
 _youtube = None
 _ytchat = None
-_emotes = {"at": 0.0, "data": None, "lock": threading.Lock()}
+_emotes = {"at": 0.0, "data": None, "complete": False, "lock": threading.Lock()}
 
 
 def _log(level, msg):
@@ -924,15 +924,26 @@ def _youtube_send_chat(text):
 # --- third-party emotes (7TV, BTTV, FFZ) -------------------------------------------
 
 def _fetch_emotes(twitch_id):
-    """name -> image URL. Global sets first, channel sets override them."""
+    """Returns (name -> image URL, complete). Global sets first, channel sets override them."""
     out = {}
+    failed = []
 
     def get(url):
-        try:
-            status, body = _http("GET", url, timeout=8)
-            return body if status == 200 else None
-        except ApiError:
-            return None
+        # One retry: a single hiccup must not leave a whole emote service out.
+        for attempt in (1, 2):
+            try:
+                status, body = _http("GET", url, timeout=8)
+            except ApiError as e:
+                status, body = 0, e.message
+            if status == 200:
+                return body
+            # 404 means the channel simply has no emotes on that service.
+            if status == 404:
+                return None
+            if attempt == 2:
+                failed.append(url.split("/")[2])
+                _log(obs.LOG_WARNING, f"Emotes: {url} failed ({status or body})")
+        return None
 
     def add_7tv(emotes):
         for e in emotes or []:
@@ -965,14 +976,16 @@ def _fetch_emotes(twitch_id):
         add_bttv(b.get("sharedEmotes"))
         add_bttv(b.get("channelEmotes"))
         add_7tv(((get(f"https://7tv.io/v3/users/twitch/{twitch_id}") or {}).get("emote_set") or {}).get("emotes"))
-    return out
+    return out, not failed
 
 
 def _get_emotes():
     with _emotes["lock"]:
-        if _emotes["data"] is None or time.time() - _emotes["at"] > EMOTE_CACHE_S:
+        # Complete lists are kept for 30 min, incomplete ones only for 1 min.
+        max_age = EMOTE_CACHE_S if _emotes.get("complete") else 60
+        if _emotes["data"] is None or time.time() - _emotes["at"] > max_age:
             ident = _twitch.chat_identity() if _twitch else None
-            _emotes["data"] = _fetch_emotes(ident["user_id"] if ident else None)
+            _emotes["data"], _emotes["complete"] = _fetch_emotes(ident["user_id"] if ident else None)
             _emotes["at"] = time.time()
         return _emotes["data"]
 

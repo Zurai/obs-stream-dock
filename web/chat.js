@@ -356,6 +356,10 @@ $('text').addEventListener('keydown', ev => {
 
 // ---- start -------------------------------------------------------------------
 
+function loadEmotes() {
+  api('GET', '/api/chat/emotes').then(r => { emotes = r.emotes || {}; }).catch(() => {});
+}
+
 async function start() {
   try {
     cfg = await api('GET', '/api/chat/config');
@@ -371,7 +375,8 @@ async function start() {
   $('to-youtube').disabled = !cfg.youtube.logged_in;
   updateCount();
 
-  api('GET', '/api/chat/emotes').then(r => { emotes = r.emotes || {}; }).catch(() => {});
+  loadEmotes();
+  setInterval(loadEmotes, 5 * 60 * 1000);  // picks up new emotes and recovers from failed loads
   connectTwitch();
   pollYoutube();
 }
