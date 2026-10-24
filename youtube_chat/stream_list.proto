@@ -1,3 +1,11 @@
+// Source: Google, "Streaming Live Chat" guide for the YouTube Live Streaming API
+// https://developers.google.com/youtube/v3/live/streaming-live-chat
+// Code samples on that page are licensed under the Apache License 2.0
+// (https://www.apache.org/licenses/LICENSE-2.0). Unlike the rest of this
+// repository (MIT), this file and the stubs generated from it
+// (stream_list_pb2*.py) fall under that license.
+// Change: added the missing import of google/protobuf/duration.proto.
+
 syntax = "proto2";
 
 package youtube.api.v3;
