@@ -10,7 +10,7 @@
 <main>
   <p class="small"><a href="./">← OBS Stream Dock</a></p>
   <h1>Privacy Policy</h1>
-  <p class="small">Last updated: October 24, 2026 (combined chat added)</p>
+  <p class="small">Last updated: October 25, 2026 (Twitch emote list for the emote picker added)</p>
 
   <p>OBS Stream Dock ("the plugin") is an open-source script for OBS Studio. It runs entirely on your own computer.
      The author does not operate any server for it and does not receive, collect or store any of your data.</p>
@@ -18,8 +18,9 @@
   <h2>What the plugin accesses</h2>
   <p>When you log in, you grant the plugin access to your accounts through the official login pages of Twitch and Google:</p>
   <ul>
-    <li><strong>Twitch</strong> (scopes <code>channel:manage:broadcast</code> and <code>user:write:chat</code>): your user name and ID, your channel's current title and category,
-        the permission to change title and category, and the permission to send chat messages in your name when you use the chat dock.
+    <li><strong>Twitch</strong> (scopes <code>channel:manage:broadcast</code>, <code>user:write:chat</code> and <code>user:read:emotes</code>): your user name and ID, your channel's current title and category,
+        the permission to change title and category, the permission to send chat messages in your name when you use the chat dock,
+        and the list of Twitch emotes you are allowed to use (including the names of the channels they belong to), for the emote picker in the chat dock.
         It also searches Twitch categories when you type in the category field. Your channel's public chat is read anonymously, without your login.</li>
     <li><strong>YouTube</strong> (scope <code>https://www.googleapis.com/auth/youtube</code>): your channel name and ID,
         your live broadcasts (title, description, status, scheduled time), the permission to change the title and description of these broadcasts,

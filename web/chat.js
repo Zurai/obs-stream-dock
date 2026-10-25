@@ -10,7 +10,11 @@ const MAX_MESSAGES = 300;
 const BADGES = { owner: 'HOST', mod: 'MOD', vip: 'VIP', member: 'SUB', verified: '✓' };
 
 let cfg = null;       // /api/chat/config
-let emotes = {};      // 7TV/BTTV/FFZ: name -> url
+let emotes = {};      // 7TV/BTTV/FFZ: name -> url, for rendering messages
+let emoteSets = [];   // picker groups in display order: {key, label, source, scope, emotes: [{name, url}]}
+let emoteIndex = [];  // every name once (first set wins): {name, lower, url, label, rank}
+let emoteNames = new Set();
+let twitchEmoteNote = null;
 
 async function api(method, path, body) {
   const opts = { method, cache: 'no-store', headers: {} };
@@ -319,10 +323,13 @@ function selectedTargets() {
 }
 
 function updateCount() {
-  const limit = selectedTargets().includes('youtube') ? cfg.limits.youtube : cfg.limits.twitch;
+  const toYt = selectedTargets().includes('youtube');
+  const limit = toYt ? cfg.limits.youtube : cfg.limits.twitch;
   const n = $('text').value.length;
   $('count').textContent = n ? `${n}/${limit}` : '';
   $('count').className = n > limit ? 'err' : 'muted';
+  // YouTube has no 7TV/BTTV/FFZ or Twitch emotes: viewers there just see the name.
+  $('send-hint').hidden = !(toYt && $('text').value.split(/\s+/).some(w => emoteNames.has(w)));
 }
 
 $('text').addEventListener('input', updateCount);
@@ -351,8 +358,191 @@ $('send').addEventListener('submit', async ev => {
 });
 
 $('text').addEventListener('keydown', ev => {
+  if (!$('ac').hidden) {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const n = ac.items.length;
+      setActive((ac.active + (ev.key === 'ArrowDown' ? 1 : n - 1)) % n);
+      return;
+    }
+    if (ev.key === 'Tab' || ev.key === 'Enter') { ev.preventDefault(); acceptSuggestion(ac.active); return; }
+    if (ev.key === 'Escape') { ev.preventDefault(); closeAc(); return; }
+  }
+  if (ev.key === 'Escape' && !$('picker').hidden) { ev.preventDefault(); togglePicker(false); return; }
   if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); $('send').requestSubmit(); }
 });
+
+// ---- emotes: index, picker, ":" autocomplete ------------------------------------
+
+const SOURCE_SHORT = { twitch: 'Twitch', '7tv': '7TV', bttv: 'BTTV', ffz: 'FFZ' };
+
+function buildEmoteIndex() {
+  emoteIndex = [];
+  emoteNames = new Set();
+  emoteSets.forEach((set, rank) => {
+    for (const e of set.emotes) {
+      if (emoteNames.has(e.name)) continue;  // same name in a later set: the earlier one wins
+      emoteNames.add(e.name);
+      emoteIndex.push({ name: e.name, lower: e.name.toLowerCase(), url: e.url, label: set.label, rank });
+    }
+  });
+}
+
+// Exact match, then start of the name, then anywhere in it (":gers" finds POGGERS).
+// Within each: channel sets before global ones, then shorter names.
+function searchEmotes(query, limit) {
+  const q = query.toLowerCase();
+  const hits = [];
+  for (const e of emoteIndex) {
+    const at = e.lower.indexOf(q);
+    if (at < 0) continue;
+    hits.push({ e, kind: e.lower === q ? 0 : at === 0 ? 1 : 2, at });
+  }
+  hits.sort((a, b) => a.kind - b.kind || a.e.rank - b.e.rank || a.e.name.length - b.e.name.length
+    || a.e.lower.localeCompare(b.e.lower));
+  return (limit ? hits.slice(0, limit) : hits);
+}
+
+function insertAt(start, end, name) {
+  const input = $('text');
+  const v = input.value;
+  const before = v.slice(0, start);
+  const after = v.slice(end);
+  const lead = before && !/\s$/.test(before) ? ' ' : '';
+  const trail = /^\s/.test(after) ? '' : ' ';
+  input.value = before + lead + name + trail + after;
+  const pos = before.length + lead.length + name.length + trail.length;
+  input.focus();
+  input.setSelectionRange(pos, pos);
+  updateCount();
+}
+
+// -- picker
+
+function emoteButton(name, url) {
+  const b = el('button');
+  b.type = 'button';
+  b.dataset.name = name;
+  b.title = name;
+  const img = el('img');
+  img.src = url;
+  img.alt = name;
+  img.loading = 'lazy';
+  b.append(img);
+  return b;
+}
+
+function renderPicker() {
+  const list = $('picker-list');
+  list.replaceChildren();
+  const q = $('picker-search').value.trim();
+  if (q) {
+    const hits = searchEmotes(q);
+    const grid = el('div', 'emote-grid');
+    for (const { e } of hits) grid.append(emoteButton(e.name, e.url));
+    list.append(hits.length ? grid : el('div', 'muted', 'No emote found'));
+  } else {
+    for (const set of emoteSets) {
+      const group = el('div', 'emote-group');
+      group.append(el('h4', null, `${set.label} (${set.emotes.length})`));
+      const grid = el('div', 'emote-grid');
+      for (const e of set.emotes) grid.append(emoteButton(e.name, e.url));
+      group.append(grid);
+      list.append(group);
+    }
+    if (!emoteSets.length) list.append(el('div', 'muted', 'Loading emotes …'));
+  }
+  $('picker-note').textContent = twitchEmoteNote || '';
+  $('picker-note').hidden = !twitchEmoteNote;
+}
+
+function togglePicker(open = $('picker').hidden) {
+  $('picker').hidden = !open;
+  $('emote-btn').setAttribute('aria-expanded', String(open));
+  if (open) {
+    closeAc();
+    renderPicker();
+    $('picker-search').focus();
+  } else {
+    $('text').focus();
+  }
+}
+
+$('emote-btn').addEventListener('click', () => togglePicker());
+$('picker-search').addEventListener('input', renderPicker);
+$('picker-search').addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') { ev.preventDefault(); togglePicker(false); }
+  if (ev.key === 'Enter') {  // Enter in the search takes the first hit
+    ev.preventDefault();
+    const first = $('picker-list').querySelector('button[data-name]');
+    if (first) first.click();
+  }
+});
+// Inserting keeps the picker open, like on Twitch, so several emotes are quick.
+$('picker-list').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-name]');
+  if (!b) return;
+  const input = $('text');
+  insertAt(input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, b.dataset.name);
+});
+document.addEventListener('mousedown', ev => {
+  if (!$('picker').hidden && !ev.target.closest('#picker, #emote-btn')) togglePicker(false);
+});
+
+// -- ":" autocomplete
+
+const ac = { items: [], active: 0, start: 0, end: 0 };
+
+function closeAc() { $('ac').hidden = true; ac.items = []; }
+
+function setActive(i) {
+  ac.active = i;
+  [...$('ac').children].forEach((li, j) => li.classList.toggle('active', j === i));
+  const li = $('ac').children[i];
+  if (li) li.scrollIntoView({ block: 'nearest' });
+}
+
+function updateAc() {
+  const input = $('text');
+  const pos = input.selectionStart;
+  // ":" at the start or after a space, then at least 2 characters. So ":D", URLs
+  // and times like 12:30 don't open the list.
+  const m = pos === input.selectionEnd && input.value.slice(0, pos).match(/(?:^|\s):([^\s:]{2,})$/);
+  const hits = m ? searchEmotes(m[1], 8) : [];
+  if (!hits.length) return closeAc();
+  ac.items = hits.map(h => h.e);
+  ac.start = pos - m[1].length - 1;
+  ac.end = pos;
+  const list = $('ac');
+  list.replaceChildren();
+  hits.forEach(({ e, at }, i) => {
+    const li = el('li');
+    li.setAttribute('role', 'option');
+    const img = el('img');
+    img.src = e.url;
+    img.alt = '';
+    const name = el('span');
+    const len = m[1].length;
+    name.append(document.createTextNode(e.name.slice(0, at)), el('mark', null, e.name.slice(at, at + len)),
+      document.createTextNode(e.name.slice(at + len)));
+    li.append(img, name, el('span', 'src', e.label));
+    li.addEventListener('mousedown', ev => { ev.preventDefault(); acceptSuggestion(i); });
+    list.append(li);
+  });
+  list.hidden = false;
+  setActive(0);
+}
+
+function acceptSuggestion(i) {
+  const e = ac.items[i];
+  if (!e) return closeAc();
+  const { start, end } = ac;
+  closeAc();
+  insertAt(start, end, e.name);
+}
+
+$('text').addEventListener('input', updateAc);
+$('text').addEventListener('blur', () => setTimeout(closeAc, 100));
 
 // ---- start -------------------------------------------------------------------
 
@@ -361,9 +551,16 @@ function loadEmotes() {
   clearTimeout(emoteRetry);
   api('GET', '/api/chat/emotes').then(r => {
     emotes = r.emotes || {};
+    emoteSets = r.sets || [];
+    twitchEmoteNote = r.twitch_note || null;
+    buildEmoteIndex();
+    if (!$('picker').hidden) renderPicker();
+    if (cfg) updateCount();
+    // Still loading in the plugin (a slow service): ask again soon.
     // A service didn't answer: the plugin retries after a minute, so ask again then.
-    if (!r.complete) emoteRetry = setTimeout(loadEmotes, 65 * 1000);
-  }).catch(() => { emoteRetry = setTimeout(loadEmotes, 65 * 1000); });
+    if (r.loading) emoteRetry = setTimeout(loadEmotes, 2000);
+    else if (!r.complete) emoteRetry = setTimeout(loadEmotes, 65 * 1000);
+  }).catch(() => { emoteRetry = setTimeout(loadEmotes, 5000); });
 }
 
 async function start() {

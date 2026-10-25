@@ -16,11 +16,19 @@
   <button id="more" hidden>new messages ↓</button>
 
   <form id="send" autocomplete="off">
+    <ul id="ac" role="listbox" hidden></ul>
+    <section id="picker" hidden>
+      <input id="picker-search" placeholder="Search emotes" aria-label="Search emotes">
+      <div id="picker-note" class="muted" hidden></div>
+      <div id="picker-list"></div>
+    </section>
     <div id="send-error" class="err" hidden></div>
+    <div id="send-hint" class="muted" hidden>Emotes show as plain text on YouTube</div>
     <div class="send-row">
       <label class="target twitch" title="Send to Twitch"><input type="checkbox" id="to-twitch" checked><span>T</span></label>
       <label class="target youtube" title="Send to YouTube"><input type="checkbox" id="to-youtube" checked><span>YT</span></label>
-      <input id="text" placeholder="Send a message" maxlength="500">
+      <input id="text" placeholder="Send a message (: for emotes)" maxlength="500">
+      <button type="button" id="emote-btn" title="Emotes" aria-label="Emotes" aria-expanded="false">☺</button>
       <span id="count" class="muted"></span>
     </div>
   </form>

@@ -97,6 +97,32 @@ body.chat-page { display: flex; flex-direction: column; height: 100vh; padding: 
 .target.youtube span { background: #e62117; }
 .target input:checked + span { opacity: 1; }
 .target input:disabled + span { opacity: .12; cursor: not-allowed; }
+#send-hint { font-size: 11px; margin-bottom: 4px; }
+
+/* emote picker and ":" autocomplete */
+#send { position: relative; }
+#emote-btn { background: none; color: var(--muted); font-size: 17px; line-height: 1; padding: 3px 4px; }
+#emote-btn:hover, #emote-btn[aria-expanded="true"] { color: var(--accent-hover); }
+#picker, #ac { position: absolute; left: 6px; right: 6px; bottom: 100%; margin-bottom: 4px; z-index: 20;
+               background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+               box-shadow: 0 -4px 14px rgba(0, 0, 0, .4); }
+#picker { display: flex; flex-direction: column; height: min(320px, 60vh); padding: 6px; }
+#picker-search { flex: none; margin-bottom: 4px; }
+#picker-note { flex: none; font-size: 11px; margin-bottom: 4px; }
+#picker-list { flex: 1; overflow-y: auto; }
+.emote-group h4 { margin: 6px 2px 2px; font-size: 10px; font-weight: 700; text-transform: uppercase;
+                  letter-spacing: .5px; color: var(--muted); }
+.emote-grid { display: flex; flex-wrap: wrap; gap: 2px; }
+.emote-grid button { width: 34px; height: 34px; padding: 2px; background: none; border-radius: 4px;
+                     display: flex; align-items: center; justify-content: center; }
+.emote-grid button:hover, .emote-grid button:focus-visible { background: var(--border); outline: none; }
+.emote-grid img { max-width: 28px; max-height: 28px; }
+#ac { margin: 0 0 4px; padding: 3px 0; list-style: none; max-height: 240px; overflow-y: auto; }
+#ac li { display: flex; align-items: center; gap: 8px; padding: 3px 8px; cursor: pointer; }
+#ac li img { width: 24px; height: 24px; object-fit: contain; flex: none; }
+#ac li .src { margin-left: auto; font-size: 10px; color: var(--muted); white-space: nowrap; }
+#ac li.active, #ac li:hover { background: var(--border); }
+#ac li mark { background: none; color: var(--accent-hover); font-weight: 700; }
 
 footer { margin-top: 14px; padding-top: 6px; border-top: 1px solid var(--border);
          display: flex; gap: 10px; font-size: 11px; }

@@ -48,6 +48,11 @@ for (const [key, label] of Object.entries(PLATFORMS)) {
 
 function setText(root, sel, text) { root.querySelector(sel).textContent = text; }
 
+const SCOPE_LABELS = { 'user:write:chat': 'chat', 'user:read:emotes': 'emotes' };
+function scopeLabels(scopes) {
+  return [...new Set(scopes.map(s => SCOPE_LABELS[s] || s))].join(', ');
+}
+
 function renderAccount(key, st) {
   const el = accountEls[key];
   const pending = st.login.state === 'pending';
@@ -56,7 +61,7 @@ function renderAccount(key, st) {
   show(el.querySelector('.login'), st.configured && (!st.logged_in || needsRelogin) && !pending);
   el.querySelector('.login').disabled = false;
   el.querySelector('.login').textContent = needsRelogin
-    ? `Log in again (new permission: chat)` : `Log in with ${PLATFORMS[key]}`;
+    ? `Log in again (new permission: ${scopeLabels(st.missing_scopes)})` : `Log in with ${PLATFORMS[key]}`;
   show(el.querySelector('.logout'), st.logged_in);
   setText(el, '.who', st.user ? st.user.display_name : (st.configured ? 'not logged in' : ''));
   show(el.querySelector('.pending'), pending);

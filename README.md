@@ -26,6 +26,7 @@ When you simulcast to Twitch and YouTube, updating the stream title means editin
 - Twitch chat is read over Twitch's anonymous IRC WebSocket; sending uses `POST /helix/chat/messages` (scope `user:write:chat`)
 - YouTube chat is read with `liveChatMessages.streamList`, a gRPC server stream that costs 5 quota units per connection instead of polling. It runs in a small helper process so gRPC can never take OBS down. Sending uses `liveChatMessages.insert` (50 units per message)
 - Twitch emotes plus 7TV, BTTV and FFZ emotes of your channel
+- **Emote picker** (☺ next to the input, grouped by channel and global, with search) and **`:` autocomplete**: type `:pog` and pick `Pog` with the arrow keys and Tab/Enter. It covers 7TV, BTTV, FFZ and every Twitch emote you may use, including subs on other channels (`GET /helix/chat/emotes/user`, scope `user:read:emotes`)
 - Super Chats, memberships and gifts are highlighted; deleted messages and banned users are struck through
 - The chat is meant for **you**: showing a merged chat on the Twitch stream itself conflicts with Twitch's simulcasting rules
 

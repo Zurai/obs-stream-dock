@@ -79,7 +79,8 @@ _streaming = threading.Event()  # mirrors the OBS main stream state
 _twitch = None
 _youtube = None
 _ytchat = None
-_emotes = {"at": 0.0, "data": None, "complete": False, "lock": threading.Lock()}
+_emotes = {"at": 0.0, "data": None, "complete": False, "loading": False, "gen": 0, "key": None,
+           "lock": threading.Lock()}
 
 
 def _log(level, msg):
@@ -375,8 +376,9 @@ class Twitch(DeviceFlowAccount):
     revoke_url = "https://id.twitch.tv/oauth2/revoke"
     validate_url = "https://id.twitch.tv/oauth2/validate"
     scope_param = "scopes"
-    # user:write:chat lets the chat dock send messages as you.
-    scopes = "channel:manage:broadcast user:write:chat"
+    # user:write:chat lets the chat dock send messages as you,
+    # user:read:emotes fills its emote picker with every Twitch emote you may use.
+    scopes = "channel:manage:broadcast user:write:chat user:read:emotes"
 
     def __init__(self, client_id):
         super().__init__(client_id, None, TWITCH_TOKEN_PATH)
@@ -459,6 +461,70 @@ class Twitch(DeviceFlowAccount):
             reason = (d.get("drop_reason") or {}).get("message") or "message was dropped"
             raise ApiError(400, f"Twitch: {reason}")
         return d.get("message_id")
+
+    def user_emotes(self):
+        """Every Twitch emote you may use, grouped for the picker.
+
+        Returns a list of sets ({key, label, source, emotes: [{name, url}]}):
+        your channel first, then other channels (sub emotes etc.), then global.
+        Raises ApiError(403) if the login predates the user:read:emotes scope.
+        """
+        if "user:read:emotes" in self.missing_scopes():
+            raise ApiError(403, "Twitch: log in again to load your Twitch emotes")
+        uid = self._user_id()
+        items, template, after = [], None, None
+        for _ in range(30):  # pages of ~100; a hard stop in case the cursor never ends
+            params = {"user_id": uid, "broadcaster_id": uid}
+            if after:
+                params["after"] = after
+            body = self.helix("GET", "/chat/emotes/user", params) or {}
+            items += body.get("data") or []
+            template = body.get("template") or template
+            after = (body.get("pagination") or {}).get("cursor")
+            if not after:
+                break
+        template = template or "https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}"
+
+        channel_types = {"subscriptions", "follower", "bitstier", "channelpoints"}
+        own, others, glob = [], {}, []
+        seen = set()
+        for e in items:
+            name, eid = e.get("name"), e.get("id")
+            # Smilies like ":)" come as regex patterns (R-?\)) and can't be typed as named.
+            if not name or not eid or "\\" in name or (name, eid) in seen:
+                continue
+            seen.add((name, eid))
+            fmt = "animated" if "animated" in (e.get("format") or []) else "static"
+            url = (template.replace("{{id}}", urllib.parse.quote(eid)).replace("{{format}}", fmt)
+                   .replace("{{theme_mode}}", "dark").replace("{{scale}}", "1.0"))
+            emote = {"name": name, "url": url}
+            owner = e.get("owner_id") or ""
+            if owner == uid:
+                own.append(emote)
+            elif e.get("emote_type") in channel_types and owner not in ("", "0"):
+                others.setdefault(owner, []).append(emote)
+            else:
+                glob.append(emote)
+
+        names = {}
+        ids = list(others)
+        for i in range(0, len(ids), 100):
+            try:
+                body = self.helix("GET", "/users", [("id", x) for x in ids[i:i + 100]]) or {}
+                names.update({u["id"]: u["display_name"] for u in body.get("data") or []})
+            except ApiError as e:
+                _log(obs.LOG_WARNING, f"Emotes: could not read channel names ({e.message})")
+
+        with self.lock:
+            me = (self.tokens or {}).get("display_name") or "your channel"
+        sets = [{"key": "twitch-channel", "label": f"Twitch · {me}", "source": "twitch",
+                 "scope": "channel", "emotes": own}]
+        for owner in sorted(others, key=lambda o: names.get(o, o).lower()):
+            sets.append({"key": f"twitch-{owner}", "label": f"Twitch · {names.get(owner, owner)}",
+                         "source": "twitch", "scope": "other", "emotes": others[owner]})
+        sets.append({"key": "twitch-global", "label": "Twitch · global", "source": "twitch",
+                     "scope": "global", "emotes": glob})
+        return [s for s in sets if s["emotes"]]
 
 
 # --- YouTube ------------------------------------------------------------------
@@ -921,29 +987,33 @@ def _youtube_send_chat(text):
     return (body or {}).get("id")
 
 
-# --- third-party emotes (7TV, BTTV, FFZ) -------------------------------------------
+# --- emotes (Twitch, 7TV, BTTV, FFZ) ----------------------------------------------
+#
+# Loaded in a background thread so a slow service never holds up the dock: after
+# EMOTE_FIRST_WAIT_S the dock gets what is there (loading=True) and asks again
+# shortly, slow services (FrankerFaceZ sometimes takes 20 s+) follow.
 
-def _fetch_emotes(twitch_id):
-    """Returns (name -> image URL, complete). Global sets first, channel sets override them."""
-    failed = []
+EMOTE_FIRST_WAIT_S = 4
 
-    def get(url):
-        # One retry: a single hiccup must not leave a whole emote service out.
-        # FrankerFaceZ in particular sometimes doesn't answer for a while.
-        for attempt in (1, 2):
-            try:
-                status, body = _http("GET", url, timeout=12)
-            except ApiError as e:
-                status, body = 0, e.message
-            if status == 200:
-                return body
-            if status == 404:  # the channel simply has no emotes on that service
-                return None
-            if attempt == 2:
-                failed.append(url.split("/")[2])
-                _log(obs.LOG_WARNING, f"Emotes: {url} failed ({status or body})")
-        return None
 
+def _emote_get(url, failed):
+    # One retry: a single hiccup must not leave a whole emote service out.
+    for attempt in (1, 2):
+        try:
+            status, body = _http("GET", url, timeout=12)
+        except ApiError as e:
+            status, body = 0, e.message
+        if status == 200:
+            return body
+        if status == 404:  # the channel simply has no emotes on that service
+            return None
+        if attempt == 2:
+            failed.append(url.split("/")[2])
+            _log(obs.LOG_WARNING, f"Emotes: {url} failed ({status or body})")
+    return None
+
+
+def _emote_urls(twitch_id):
     urls = {
         "ffz_global": "https://api.frankerfacez.com/v1/set/global",
         "bttv_global": "https://api.betterttv.net/3/cached/emotes/global",
@@ -955,58 +1025,139 @@ def _fetch_emotes(twitch_id):
             "bttv_channel": f"https://api.betterttv.net/3/cached/users/twitch/{twitch_id}",
             "7tv_channel": f"https://7tv.io/v3/users/twitch/{twitch_id}",
         })
-    # Fetch in parallel so one slow service doesn't hold up the others.
-    results = {}
-    threads = [threading.Thread(target=lambda k=k, u=u: results.__setitem__(k, get(u)), daemon=True)
-               for k, u in urls.items()]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(30)
+    return urls
 
-    out = {}
 
-    def add_7tv(emotes):
+def _build_emotes(results):
+    """Picker sets and the render map from whatever has arrived so far.
+
+    Returns {"emotes": name -> URL for 7TV/BTTV/FFZ in messages,
+             "sets": ordered picker groups, "twitch_note": str|None}."""
+    def from_7tv(emotes):
+        out = []
         for e in emotes or []:
             host = ((e.get("data") or {}).get("host") or {}).get("url")
             if e.get("name") and host:
-                out[e["name"]] = f"https:{host}/1x.webp" if host.startswith("//") else f"{host}/1x.webp"
+                out.append({"name": e["name"],
+                            "url": f"https:{host}/1x.webp" if host.startswith("//") else f"{host}/1x.webp"})
+        return out
 
-    def add_bttv(emotes):
-        for e in emotes or []:
-            if e.get("code") and e.get("id"):
-                out[e["code"]] = f"https://cdn.betterttv.net/emote/{e['id']}/1x"
+    def from_bttv(emotes):
+        return [{"name": e["code"], "url": f"https://cdn.betterttv.net/emote/{e['id']}/1x"}
+                for e in emotes or [] if e.get("code") and e.get("id")]
 
-    def add_ffz(emoticons):
-        for e in emoticons or []:
-            url = (e.get("urls") or {}).get("1")
-            if e.get("name") and url:
-                out[e["name"]] = url
+    def from_ffz(emoticons):
+        return [{"name": e["name"], "url": e["urls"]["1"]}
+                for e in emoticons or [] if e.get("name") and (e.get("urls") or {}).get("1")]
 
+    ffz_global = []
     g = results.get("ffz_global") or {}
     for sid in g.get("default_sets", []):
-        add_ffz((g.get("sets", {}).get(str(sid)) or {}).get("emoticons"))
-    add_bttv(results.get("bttv_global"))
-    add_7tv((results.get("7tv_global") or {}).get("emotes"))
+        ffz_global += from_ffz((g.get("sets", {}).get(str(sid)) or {}).get("emoticons"))
     f = results.get("ffz_channel") or {}
-    if f.get("room"):
-        add_ffz((f.get("sets", {}).get(str(f["room"].get("set"))) or {}).get("emoticons"))
+    ffz_channel = from_ffz((f.get("sets", {}).get(str(f["room"].get("set"))) or {}).get("emoticons")) \
+        if f.get("room") else []
     b = results.get("bttv_channel") or {}
-    add_bttv(b.get("sharedEmotes"))
-    add_bttv(b.get("channelEmotes"))
-    add_7tv(((results.get("7tv_channel") or {}).get("emote_set") or {}).get("emotes"))
-    return out, not failed
+
+    def mk(key, label, scope, emotes):
+        return {"key": key, "label": label, "source": key.split("-")[0], "scope": scope, "emotes": emotes}
+
+    channel = [
+        mk("7tv-channel", "7TV · channel", "channel",
+           from_7tv(((results.get("7tv_channel") or {}).get("emote_set") or {}).get("emotes"))),
+        mk("bttv-channel", "BTTV · channel", "channel",
+           from_bttv(b.get("channelEmotes")) + from_bttv(b.get("sharedEmotes"))),
+        mk("ffz-channel", "FFZ · channel", "channel", ffz_channel),
+    ]
+    glob = [
+        mk("7tv-global", "7TV · global", "global", from_7tv((results.get("7tv_global") or {}).get("emotes"))),
+        mk("bttv-global", "BTTV · global", "global", from_bttv(results.get("bttv_global"))),
+        mk("ffz-global", "FFZ · global", "global", ffz_global),
+    ]
+    tw = results.get("twitch") or {}
+    tw_sets = tw.get("sets") or []
+
+    def tw_scope(scope):
+        return [s for s in tw_sets if s["scope"] == scope]
+
+    sets = [s for s in tw_scope("channel") + channel + tw_scope("other") + tw_scope("global") + glob
+            if s["emotes"]]
+    # Messages only get third-party emotes as images (Twitch's own come with
+    # positions in the IRC tags). Channel emotes override global ones.
+    render = {}
+    for s in glob + channel:
+        for e in s["emotes"]:
+            render[e["name"]] = e["url"]
+    return {"emotes": render, "sets": sets, "twitch_note": tw.get("note")}
+
+
+def _publish_emotes(gen, data, *, final, complete=False):
+    with _emotes["lock"]:
+        if _emotes["gen"] != gen:
+            return  # a newer load (other login) took over
+        _emotes["data"] = data
+        if final:
+            _emotes["loading"] = False
+            _emotes["complete"] = complete
+            _emotes["at"] = time.time()
+
+
+def _load_emotes(ident, gen):
+    failed, results = [], {}
+    try:
+        jobs = {k: (lambda u=u: _emote_get(u, failed))
+                for k, u in _emote_urls(ident["user_id"] if ident else None).items()}
+        if ident and _twitch:
+            def twitch_job():
+                try:
+                    return {"sets": _twitch.user_emotes()}
+                except ApiError as e:
+                    if e.status != 403:  # 403 = login predates the emote permission
+                        _log(obs.LOG_WARNING, f"Emotes: {e.message}")
+                    return {"note": e.message, "retry": e.status != 403}
+            jobs["twitch"] = twitch_job
+        threads = [threading.Thread(target=lambda k=k, fn=fn: results.__setitem__(k, fn()),
+                                    name=f"obs-stream-dock-emotes-{k}", daemon=True)
+                   for k, fn in jobs.items()]
+        for t in threads:
+            t.start()
+        deadline = time.time() + EMOTE_FIRST_WAIT_S
+        for t in threads:
+            t.join(max(0.0, deadline - time.time()))
+        if any(t.is_alive() for t in threads):
+            _publish_emotes(gen, _build_emotes(dict(results)), final=False)
+            for t in threads:
+                t.join(60)
+        complete = (not failed and not (results.get("twitch") or {}).get("retry")
+                    and not any(t.is_alive() for t in threads))
+        _publish_emotes(gen, _build_emotes(dict(results)), final=True, complete=complete)
+    finally:
+        with _emotes["lock"]:
+            if _emotes["gen"] == gen and _emotes["loading"]:  # crashed before publishing
+                _emotes["loading"], _emotes["complete"], _emotes["at"] = False, False, time.time()
 
 
 def _get_emotes():
+    """Never blocks on the emote services; starts a background load when needed."""
     with _emotes["lock"]:
+        ident = _twitch.chat_identity() if _twitch else None
+        # A new login (other account, new permission) must not wait for the cache.
+        key = ((ident or {}).get("user_id"), tuple(_twitch.missing_scopes()) if _twitch else ())
         # Complete lists are kept for 30 min, incomplete ones only for 1 min.
-        max_age = EMOTE_CACHE_S if _emotes.get("complete") else 60
-        if _emotes["data"] is None or time.time() - _emotes["at"] > max_age:
-            ident = _twitch.chat_identity() if _twitch else None
-            _emotes["data"], _emotes["complete"] = _fetch_emotes(ident["user_id"] if ident else None)
-            _emotes["at"] = time.time()
-        return _emotes["data"], _emotes["complete"]
+        max_age = EMOTE_CACHE_S if _emotes["complete"] else 60
+        new_key = _emotes["key"] != key
+        stale = _emotes["data"] is None or time.time() - _emotes["at"] > max_age
+        if new_key or (stale and not _emotes["loading"]):
+            _emotes["gen"] += 1
+            _emotes["key"] = key
+            _emotes["loading"] = True
+            if new_key:
+                _emotes["data"] = None  # don't show the previous login's emotes
+            threading.Thread(target=_load_emotes, args=(ident, _emotes["gen"]),
+                             name="obs-stream-dock-emotes", daemon=True).start()
+        data = _emotes["data"] or {"emotes": {}, "sets": [], "twitch_note": None}
+        return {**data, "loading": _emotes["loading"],
+                "complete": _emotes["complete"] and not _emotes["loading"]}
 
 
 def _send_chat(text, targets):
@@ -1047,7 +1198,18 @@ class _ExclusiveServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+_CLIENT_GONE = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
 class _Handler(SimpleHTTPRequestHandler):
+    def handle(self):
+        # The dock went away mid-request (reloaded, closed, OBS shutting down).
+        # Nobody is left to answer, and a traceback in the OBS log would only alarm.
+        try:
+            super().handle()
+        except _CLIENT_GONE:
+            self.close_connection = True
+
     def _send_json(self, status, obj):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -1100,8 +1262,7 @@ class _Handler(SimpleHTTPRequestHandler):
                         "limits": {"twitch": TWITCH_CHAT_MAX, "youtube": YOUTUBE_CHAT_MAX},
                     })
                 if path == "/api/chat/emotes":
-                    emotes, complete = _get_emotes()
-                    return self._send_json(200, {"ok": True, "emotes": emotes, "complete": complete})
+                    return self._send_json(200, {"ok": True, **_get_emotes()})
                 if path == "/api/chat/youtube":
                     since = int((query.get("since") or ["0"])[0] or 0)
                     seq, msgs = _ytchat.since(since)
@@ -1148,6 +1309,8 @@ class _Handler(SimpleHTTPRequestHandler):
         except ApiError as e:
             status = e.status if 400 <= e.status < 600 else 502
             return self._send_json(status, {"ok": False, "error": e.message})
+        except _CLIENT_GONE:
+            raise  # not a bug, handle() drops the connection quietly
         except Exception as e:  # never let a bug kill the handler silently
             _log(obs.LOG_ERROR, f"{method} {path} failed: {e!r}")
             return self._send_json(500, {"ok": False, "error": f"Internal error: {e}"})
