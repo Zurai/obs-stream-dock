@@ -14,6 +14,7 @@ Local, never committed:
   data/twitch_tokens.json   Twitch access + refresh token
   data/google_tokens.json   Google access + refresh token
   data/youtube_pending.json title waiting for the YouTube broadcast to exist
+  data/youtube_bans.json    IDs of YouTube bans made from the dock (needed to lift them)
 
 The chat dock (web/chat.html) reads Twitch chat directly over Twitch's
 anonymous IRC WebSocket and YouTube chat through youtube_chat/helper.py,
@@ -22,6 +23,7 @@ a separate process that holds the gRPC streamList connection.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -49,6 +51,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.local.json")
 TWITCH_TOKEN_PATH = os.path.join(DATA_DIR, "twitch_tokens.json")
 GOOGLE_TOKEN_PATH = os.path.join(DATA_DIR, "google_tokens.json")
 YOUTUBE_PENDING_PATH = os.path.join(DATA_DIR, "youtube_pending.json")
+YOUTUBE_BANS_PATH = os.path.join(DATA_DIR, "youtube_bans.json")
 
 TWITCH_HELIX = "https://api.twitch.tv/helix"
 TWITCH_TITLE_MAX = 140
@@ -68,6 +71,21 @@ CHAT_FIND_POLL_S = 30                 # look for the live broadcast (1 unit per 
 CHAT_FIND_MAX_S = 15 * 60             # give up looking after this long
 CHAT_RETRY_MAX_S = 300                # max wait between reconnects (5 units each)
 TWITCH_CHAT_MAX = 500
+TWITCH_MOD_SCOPES = (
+    "moderator:manage:chat_messages",   # delete messages, clear chat
+    "moderator:manage:banned_users",    # timeout, ban, unban
+    "moderator:manage:chat_settings",   # slow, followers-only, sub-only, emote-only, unique chat
+    "moderator:manage:warnings",
+    "moderator:manage:shoutouts",
+    "moderator:manage:shield_mode",
+)
+TWITCH_TIMEOUT_MAX = 1_209_600        # 2 weeks
+MOD_REASON_MAX = 500
+TWITCH_CHAT_SETTINGS = {              # field -> type accepted from the dock
+    "slow_mode": bool, "slow_mode_wait_time": int,
+    "follower_mode": bool, "follower_mode_duration": int,
+    "subscriber_mode": bool, "emote_mode": bool, "unique_chat_mode": bool,
+}
 YOUTUBE_CHAT_MAX = 200
 EMOTE_CACHE_S = 30 * 60
 
@@ -79,6 +97,7 @@ _streaming = threading.Event()  # mirrors the OBS main stream state
 _twitch = None
 _youtube = None
 _ytchat = None
+_profile_cache = {"users": {}, "badges": None, "badges_at": 0.0, "lock": threading.Lock()}
 _emotes = {"at": 0.0, "data": None, "complete": False, "loading": False, "gen": 0, "key": None,
            "lock": threading.Lock()}
 
@@ -377,8 +396,9 @@ class Twitch(DeviceFlowAccount):
     validate_url = "https://id.twitch.tv/oauth2/validate"
     scope_param = "scopes"
     # user:write:chat lets the chat dock send messages as you,
-    # user:read:emotes fills its emote picker with every Twitch emote you may use.
-    scopes = "channel:manage:broadcast user:write:chat user:read:emotes"
+    # user:read:emotes fills its emote picker with every Twitch emote you may use,
+    # the moderator:* scopes are for the mod tools in the chat dock.
+    scopes = ("channel:manage:broadcast user:write:chat user:read:emotes " + " ".join(TWITCH_MOD_SCOPES))
 
     def __init__(self, client_id):
         super().__init__(client_id, None, TWITCH_TOKEN_PATH)
@@ -448,7 +468,8 @@ class Twitch(DeviceFlowAccount):
                 return None
             return {"login": self.tokens.get("login"), "user_id": self.tokens.get("user_id"),
                     "display_name": self.tokens.get("display_name"),
-                    "can_send": "user:write:chat" not in self.missing_scopes()}
+                    "can_send": "user:write:chat" not in self.missing_scopes(),
+                    "can_moderate": self.can_moderate()}
 
     def send_chat(self, text):
         if "user:write:chat" in self.missing_scopes():
@@ -525,6 +546,133 @@ class Twitch(DeviceFlowAccount):
         sets.append({"key": "twitch-global", "label": "Twitch · global", "source": "twitch",
                      "scope": "global", "emotes": glob})
         return [s for s in sets if s["emotes"]]
+
+    # --- moderation (you moderate your own channel: broadcaster = moderator) ---
+
+    def can_moderate(self):
+        missing = self.missing_scopes()
+        return bool(self.tokens) and not any(s in missing for s in TWITCH_MOD_SCOPES)
+
+    def _mod(self, method, path, scope, params=None, json_body=None):
+        if scope in self.missing_scopes():
+            raise ApiError(403, "Twitch: log in again in the Stream Info dock to allow moderation")
+        uid = self._user_id()
+        return self.helix(method, path, {"broadcaster_id": uid, "moderator_id": uid, **(params or {})},
+                          json_body=json_body)
+
+    def user_info(self, user_id):
+        """Profile for the user card. Cached for 10 minutes."""
+        user_id = str(user_id)
+        if not user_id.isdigit():
+            raise ApiError(400, "Invalid Twitch user ID")
+        now = time.time()
+        with _profile_cache["lock"]:
+            hit = _profile_cache["users"].get(user_id)
+            if hit and now - hit[0] < 600:
+                return hit[1]
+        data = (self.helix("GET", "/users", {"id": user_id}) or {}).get("data") or []
+        if not data:
+            raise ApiError(404, "Twitch: user not found (account deleted or suspended?)")
+        u = data[0]
+        info = {k: u.get(k) for k in ("id", "login", "display_name", "profile_image_url",
+                                      "created_at", "broadcaster_type", "description")}
+        with _profile_cache["lock"]:
+            users = _profile_cache["users"]
+            if len(users) > 500:
+                users.clear()
+            users[user_id] = (now, info)
+        return info
+
+    def chat_badges(self):
+        """'set_id/version' -> {url, title}; your channel's badges (sub badges) override global ones.
+        Cached for an hour."""
+        now = time.time()
+        with _profile_cache["lock"]:
+            if _profile_cache["badges"] and now - _profile_cache["badges_at"] < 3600:
+                return _profile_cache["badges"]
+        out = {}
+        for params in (None, {"broadcaster_id": self._user_id()}):
+            path = "/chat/badges" if params else "/chat/badges/global"
+            for s in (self.helix("GET", path, params) or {}).get("data") or []:
+                for v in s.get("versions") or []:
+                    url = v.get("image_url_2x") or v.get("image_url_1x")
+                    if url:
+                        out[f"{s['set_id']}/{v['id']}"] = {"url": url, "title": v.get("title") or s["set_id"]}
+        with _profile_cache["lock"]:
+            _profile_cache["badges"], _profile_cache["badges_at"] = out, now
+        return out
+
+    def find_user(self, login):
+        login = (login or "").strip().lstrip("@").lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,25}", login):
+            raise ApiError(400, f"Twitch: '{login}' is not a valid user name")
+        data = (self.helix("GET", "/users", {"login": login}) or {}).get("data") or []
+        if not data:
+            raise ApiError(404, f"Twitch: there is no user named {login}")
+        u = data[0]
+        return {"id": u["id"], "login": u["login"], "display_name": u["display_name"]}
+
+    def delete_message(self, message_id=None):
+        """Deletes one message, or clears the whole chat if message_id is None."""
+        self._mod("DELETE", "/moderation/chat", "moderator:manage:chat_messages",
+                  {"message_id": message_id} if message_id else None)
+
+    def ban(self, user_id, duration=None, reason=None):
+        """Ban, or timeout when duration (seconds) is given."""
+        data = {"user_id": str(user_id)}
+        if duration is not None:
+            duration = int(duration)
+            if not 1 <= duration <= TWITCH_TIMEOUT_MAX:
+                raise ApiError(400, "Twitch: a timeout must be between 1 second and 2 weeks")
+            data["duration"] = duration
+        if reason:
+            data["reason"] = str(reason)[:MOD_REASON_MAX]
+        body = self._mod("POST", "/moderation/bans", "moderator:manage:banned_users", json_body={"data": data})
+        return ((body or {}).get("data") or [{}])[0]
+
+    def unban(self, user_id):
+        self._mod("DELETE", "/moderation/bans", "moderator:manage:banned_users", {"user_id": str(user_id)})
+
+    def warn(self, user_id, reason):
+        reason = (reason or "").strip()
+        if not reason:
+            raise ApiError(400, "Twitch: a warning needs a reason")
+        self._mod("POST", "/moderation/warnings", "moderator:manage:warnings",
+                  json_body={"data": {"user_id": str(user_id), "reason": reason[:MOD_REASON_MAX]}})
+
+    def shoutout(self, user_id):
+        if "moderator:manage:shoutouts" in self.missing_scopes():
+            raise ApiError(403, "Twitch: log in again in the Stream Info dock to allow moderation")
+        uid = self._user_id()
+        self.helix("POST", "/chat/shoutouts", {"from_broadcaster_id": uid, "to_broadcaster_id": str(user_id),
+                                               "moderator_id": uid})
+
+    def chat_settings(self):
+        body = self.helix("GET", "/chat/settings", {"broadcaster_id": self._user_id()})
+        return ((body or {}).get("data") or [{}])[0]
+
+    def update_chat_settings(self, settings):
+        patch = {}
+        for k, v in (settings or {}).items():
+            typ = TWITCH_CHAT_SETTINGS.get(k)
+            if typ is None:
+                raise ApiError(400, f"Unknown chat setting: {k}")
+            patch[k] = bool(v) if typ is bool else int(v)
+        if not patch:
+            raise ApiError(400, "Nothing to change")
+        body = self._mod("PATCH", "/chat/settings", "moderator:manage:chat_settings", json_body=patch)
+        return ((body or {}).get("data") or [{}])[0]
+
+    def shield_mode(self):
+        if "moderator:manage:shield_mode" in self.missing_scopes():
+            return None
+        body = self._mod("GET", "/moderation/shield_mode", "moderator:manage:shield_mode")
+        return bool((((body or {}).get("data") or [{}])[0]).get("is_active"))
+
+    def set_shield_mode(self, active):
+        body = self._mod("PUT", "/moderation/shield_mode", "moderator:manage:shield_mode",
+                         json_body={"is_active": bool(active)})
+        return bool((((body or {}).get("data") or [{}])[0]).get("is_active"))
 
 
 # --- YouTube ------------------------------------------------------------------
@@ -755,6 +903,7 @@ def _normalize_yt(item):
         "ts": s.get("publishedAt"),
         "author": a.get("displayName") or "",
         "author_id": a.get("channelId") or s.get("authorChannelId"),
+        "avatar": a.get("profileImageUrl"),
         "owner": bool(a.get("isChatOwner")),
         "mod": bool(a.get("isChatModerator")),
         "member": bool(a.get("isChatSponsor")),
@@ -972,7 +1121,7 @@ class YouTubeChat:
         return last
 
 
-def _youtube_send_chat(text):
+def _youtube_chat_id():
     chat_id = _ytchat.live_chat_id if _ytchat else None
     if not chat_id:
         for b in _youtube.list_broadcasts("active"):
@@ -981,10 +1130,141 @@ def _youtube_send_chat(text):
                 break
     if not chat_id:
         raise ApiError(409, "YouTube: no live broadcast with chat right now")
+    return chat_id
+
+
+def _youtube_send_chat(text):
+    chat_id = _youtube_chat_id()
     body = _youtube.api("POST", "/liveChat/messages", {"part": "snippet"}, json_body={
         "snippet": {"liveChatId": chat_id, "type": "textMessageEvent",
                     "textMessageDetails": {"messageText": text}}})
     return (body or {}).get("id")
+
+
+# --- moderation -------------------------------------------------------------------
+#
+# Twitch: Helix moderation endpoints, you act as moderator of your own channel.
+# YouTube: liveChatMessages.delete (20 quota units), liveChatBans.insert/delete
+# (200 units each). YouTube can only lift a ban by the ban's ID, which only the
+# insert call returns and no API lists, so the IDs are kept in data/youtube_bans.json.
+# YouTube has no chat modes, warnings or ban reasons in its API.
+
+_yt_bans_lock = threading.Lock()
+
+
+def _youtube_ban(channel_id, name, duration=None):
+    chat_id = _youtube_chat_id()
+    snippet = {"liveChatId": chat_id, "type": "temporary" if duration else "permanent",
+               "bannedUserDetails": {"channelId": channel_id}}
+    if duration:
+        snippet["banDurationSeconds"] = int(duration)
+    body = _youtube.api("POST", "/liveChat/bans", {"part": "snippet"}, json_body={"snippet": snippet})
+    with _yt_bans_lock:
+        bans = _read_json(YOUTUBE_BANS_PATH) or {}
+        now = time.time()
+        bans = {k: v for k, v in bans.items() if not v.get("until") or v["until"] > now}  # drop ended timeouts
+        bans[channel_id] = {"ban_id": (body or {}).get("id"), "name": name, "chat_id": chat_id, "at": now,
+                            "until": now + int(duration) if duration else None}
+        _write_json(YOUTUBE_BANS_PATH, bans)
+
+
+def _youtube_unban(channel_id):
+    with _yt_bans_lock:
+        entry = (_read_json(YOUTUBE_BANS_PATH) or {}).get(channel_id)
+    if not entry or not entry.get("ban_id"):
+        raise ApiError(404, "YouTube: this ban was not made from the dock, so its ID is unknown. "
+                            "Lift it in YouTube Studio")
+    try:
+        _youtube.api("DELETE", "/liveChat/bans", {"id": entry["ban_id"]})
+    except ApiError as e:
+        if e.status != 404:  # 404 = already lifted or timeout over
+            raise
+    with _yt_bans_lock:
+        bans = _read_json(YOUTUBE_BANS_PATH) or {}
+        bans.pop(channel_id, None)
+        _write_json(YOUTUBE_BANS_PATH, bans)
+
+
+def _mod_duration(value, default=600):
+    try:
+        d = int(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid timeout duration")
+    if d < 1:
+        raise ApiError(400, "A timeout must be at least 1 second")
+    return d
+
+
+def _moderate_twitch(action, b):
+    tw = _twitch
+    if not tw or not tw.tokens:
+        raise ApiError(401, "Not logged in to Twitch")
+
+    def target():
+        if b.get("user_id"):
+            uid = str(b["user_id"])
+            return {"id": uid, "login": b.get("login"), "display_name": b.get("name") or b.get("login") or uid}
+        return tw.find_user(b.get("login"))
+
+    if action == "delete":
+        if not b.get("message_id"):
+            raise ApiError(400, "No message selected")
+        tw.delete_message(str(b["message_id"]))
+        return {}
+    if action == "clear":
+        tw.delete_message(None)
+        return {}
+    if action in ("timeout", "ban"):
+        u = target()
+        r = tw.ban(u["id"], _mod_duration(b.get("duration")) if action == "timeout" else None, b.get("reason"))
+        return {"user": u, "end_time": r.get("end_time")}
+    if action == "unban":
+        u = target()
+        tw.unban(u["id"])
+        return {"user": u}
+    if action == "warn":
+        u = target()
+        tw.warn(u["id"], b.get("reason"))
+        return {"user": u}
+    if action == "shoutout":
+        u = target()
+        tw.shoutout(u["id"])
+        return {"user": u}
+    if action == "settings":
+        return {"settings": tw.update_chat_settings(b.get("settings"))}
+    if action == "shield":
+        return {"shield": tw.set_shield_mode(b.get("active"))}
+    raise ApiError(400, f"Unknown Twitch action: {action}")
+
+
+def _moderate_youtube(action, b):
+    if not _youtube or not _youtube.tokens:
+        raise ApiError(401, "Not logged in to YouTube")
+    name = b.get("name") or "user"
+    if action == "delete":
+        if not b.get("message_id"):
+            raise ApiError(400, "No message selected")
+        _youtube.api("DELETE", "/liveChat/messages", {"id": str(b["message_id"])})
+        return {}
+    if action in ("timeout", "ban", "unban"):
+        cid = str(b.get("channel_id") or "")
+        if not re.fullmatch(r"[\w-]{10,40}", cid):
+            raise ApiError(400, "YouTube: no valid channel ID for this user")
+        if action == "unban":
+            _youtube_unban(cid)
+        else:
+            _youtube_ban(cid, name, _mod_duration(b.get("duration")) if action == "timeout" else None)
+        return {"user": {"display_name": name}}
+    raise ApiError(400, f"YouTube does not offer '{action}' in its API")
+
+
+def _moderate(b):
+    platform, action = b.get("platform"), b.get("action")
+    if platform == "twitch":
+        return _moderate_twitch(action, b)
+    if platform == "youtube":
+        return _moderate_youtube(action, b)
+    raise ApiError(400, "Unknown platform")
 
 
 # --- emotes (Twitch, 7TV, BTTV, FFZ) ----------------------------------------------
@@ -1258,9 +1538,12 @@ class _Handler(SimpleHTTPRequestHandler):
                     return self._send_json(200, {
                         "ok": True,
                         "twitch": tw.chat_identity(),
-                        "youtube": {"logged_in": bool(yt.tokens)},
+                        "youtube": {"logged_in": bool(yt.tokens), "can_moderate": bool(yt.tokens)},
                         "limits": {"twitch": TWITCH_CHAT_MAX, "youtube": YOUTUBE_CHAT_MAX},
                     })
+                if path == "/api/mod/twitch/state":
+                    return self._send_json(200, {"ok": True, "shield": tw.shield_mode(),
+                                                 "settings": tw.chat_settings()})
                 if path == "/api/chat/emotes":
                     return self._send_json(200, {"ok": True, **_get_emotes()})
                 if path == "/api/chat/youtube":
@@ -1270,6 +1553,10 @@ class _Handler(SimpleHTTPRequestHandler):
                                                  "state": _ytchat.public_state()})
                 if path == "/api/twitch/channel":
                     return self._send_json(200, {"ok": True, **tw.get_channel()})
+                if path == "/api/twitch/user":
+                    return self._send_json(200, {"ok": True, **tw.user_info((query.get("id") or [""])[0])})
+                if path == "/api/twitch/badges":
+                    return self._send_json(200, {"ok": True, "badges": tw.chat_badges()})
                 if path == "/api/twitch/categories":
                     q = (query.get("q") or [""])[0]
                     return self._send_json(200, {"ok": True, "data": tw.search_categories(q)})
@@ -1300,6 +1587,8 @@ class _Handler(SimpleHTTPRequestHandler):
                 if path == "/api/chat/youtube/disconnect":
                     _ytchat.stop()
                     return self._send_json(200, {"ok": True})
+                if path == "/api/mod":
+                    return self._send_json(200, {"ok": True, **_moderate(body)})
                 if path == "/api/chat/send":
                     targets = [t for t in (body.get("targets") or []) if t in ("twitch", "youtube")]
                     if not targets:

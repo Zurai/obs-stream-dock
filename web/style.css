@@ -124,6 +124,74 @@ body.chat-page { display: flex; flex-direction: column; height: 100vh; padding: 
 #ac li.active, #ac li:hover { background: var(--border); }
 #ac li mark { background: none; color: var(--accent-hover); font-weight: 700; }
 
+/* moderation */
+.small { font-size: 11px; }
+#chat-status { align-items: center; }
+#modes { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+.mode-chip { font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 3px; background: var(--border); color: var(--text); }
+.mode-chip.shield { background: var(--err); color: #1e1e2e; }
+#mod-btn { background: none; color: var(--muted); padding: 0 2px; font-size: 14px; }
+#mod-btn:hover, #mod-btn[aria-expanded="true"] { color: var(--accent-hover); }
+.popover { position: absolute; top: 30px; left: 6px; right: 6px; z-index: 30; padding: 8px 10px;
+           background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+           box-shadow: 0 6px 18px rgba(0, 0, 0, .45); max-height: calc(100vh - 110px); overflow-y: auto; }
+.pop-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.pop-close { margin-left: auto; background: none; color: var(--muted); font-size: 16px; padding: 0 4px; }
+.pop-close:hover { color: var(--text); }
+.popover button { background: var(--border); color: var(--text); padding: 4px 8px; font-size: 12px; }
+.popover button:hover:not(:disabled) { background: #4a4a66; }
+.popover button.danger { background: rgba(243, 139, 168, .18); color: var(--err); }
+.popover button.danger:hover:not(:disabled) { background: rgba(243, 139, 168, .32); }
+.popover button.arming, .mod-actions button.arming { background: var(--err) !important; color: #1e1e2e !important; }
+.popover input { padding: 4px 6px; }
+.mp-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; font-weight: 400; }
+.mp-row input[type="checkbox"] { width: auto; }
+.mp-row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; font: inherit; }
+.mp-actions { display: flex; gap: 6px; margin: 8px 0 6px; }
+.mp-actions button { flex: 1; }
+.mod-btn-shield.on { background: var(--err); color: #1e1e2e; font-weight: 700; }
+
+.msg { position: relative; }
+.msg .name { cursor: pointer; }
+.msg .name:hover { text-decoration: underline; }
+.mod-actions { position: absolute; right: 0; top: 0; display: none; gap: 1px; padding: 1px;
+               background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+.msg:hover .mod-actions { display: flex; }
+.mod-actions button { background: none; padding: 0 4px; font-size: 12px; line-height: 18px; color: var(--text); }
+.mod-actions button:hover { background: var(--border); }
+
+/* user card, modelled on Twitch's viewer card */
+#usercard { padding: 0; background: #18181b; border-color: #2f2f35; }
+.uc-banner { position: relative; display: flex; align-items: center; gap: 12px; padding: 14px 12px 12px;
+             background: linear-gradient(135deg, color-mix(in srgb, var(--uc-color) 30%, #0e0e10) 0%, #18181b 75%); }
+.uc-avatar { flex: none; width: 64px; height: 64px; border-radius: 50%; overflow: hidden; display: flex;
+             align-items: center; justify-content: center; font-size: 26px; font-weight: 700; color: #fff;
+             background: color-mix(in srgb, var(--uc-color) 45%, #26262c); box-shadow: 0 0 0 2px rgba(255, 255, 255, .12); }
+.uc-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.uc-id { min-width: 0; padding-right: 48px; }
+.uc-name { font-size: 18px; font-weight: 700; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uc-badges { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+.uc-badges .badge-img { width: 20px; height: 20px; }
+.uc-tools { position: absolute; top: 6px; right: 6px; display: flex; align-items: center; gap: 2px; }
+.uc-tools .pop-close { margin-left: 0; }
+.uc-info { padding: 8px 12px; border-top: 1px solid #2f2f35; border-bottom: 1px solid #2f2f35; }
+.uc-line { display: flex; align-items: center; gap: 10px; padding: 2px 0; font-size: 12.5px; }
+.uc-ico { width: 18px; text-align: center; flex: none; }
+.uc-actions { padding: 6px 12px 8px; }
+#usercard .uc-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 5px 0; }
+#usercard .uc-row > span { font-size: 11px; color: var(--muted); min-width: 56px; }
+#usercard .uc-reason { margin: 4px 0; background: #0e0e10; }
+.uc-divider { display: flex; align-items: center; gap: 8px; padding: 2px 12px; font-size: 10px; font-weight: 700;
+              text-transform: uppercase; letter-spacing: .6px; color: #eb0400; }
+.uc-divider::before, .uc-divider::after { content: ""; flex: 1; height: 1px; background: #eb0400; opacity: .7; }
+.uc-log { padding: 4px 12px 10px; max-height: 170px; overflow-y: auto; font-size: 13px; line-height: 1.5; word-wrap: break-word; }
+.uc-log > div { padding: 1px 0; }
+.uc-log > div.deleted { opacity: .4; text-decoration: line-through; }
+.uc-log time { color: var(--muted); font-size: 11px; margin-right: 5px; }
+.uc-log .badge-img { width: 18px; height: 18px; vertical-align: -4px; margin-right: 3px; }
+.uc-log .name { cursor: default; }
+.uc-log .name:hover { text-decoration: none; }
+
 footer { margin-top: 14px; padding-top: 6px; border-top: 1px solid var(--border);
          display: flex; gap: 10px; font-size: 11px; }
 footer #diag-link { margin-left: auto; }

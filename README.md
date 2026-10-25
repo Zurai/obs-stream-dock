@@ -28,6 +28,11 @@ When you simulcast to Twitch and YouTube, updating the stream title means editin
 - Twitch emotes plus 7TV, BTTV and FFZ emotes of your channel
 - **Emote picker** (☺ next to the input, grouped by channel and global, with search) and **`:` autocomplete**: type `:pog` and pick `Pog` with the arrow keys and Tab/Enter. It covers 7TV, BTTV, FFZ and every Twitch emote you may use, including subs on other channels (`GET /helix/chat/emotes/user`, scope `user:read:emotes`)
 - Super Chats, memberships and gifts are highlighted; deleted messages and banned users are struck through
+- **Mod tools** for both platforms: hover a message for delete / 10-minute timeout / ban (bans need a second click), click a name for a user card in the style of Twitch's viewer card (profile picture, badges, account age, subscription months, the user's messages with time) with timeouts from 1 minute to 1 week, ban, unban, warn and shoutout (Twitch)
+- **Twitch chat modes** behind 🛡 in the header: slow, followers-only, subscribers-only, emote-only, unique chat, Shield Mode and clear chat. Active modes show as chips in the header
+- **Slash commands** for Twitch like in Twitch's own chat: `/ban`, `/unban`, `/timeout user 10m reason`, `/untimeout`, `/warn`, `/shoutout` (`/so`), `/clear`, `/slow`, `/followers`, `/subscribers`, `/emoteonly`, `/uniquechat` (each with an `…off` variant), `/shield`, `/shieldoff`, `/help`
+- Twitch moderation uses the Helix moderation endpoints (scopes `moderator:manage:chat_messages`, `…:banned_users`, `…:chat_settings`, `…:warnings`, `…:shoutouts`, `…:shield_mode`)
+- YouTube moderation uses `liveChatMessages.delete` (20 quota units) and `liveChatBans.insert`/`delete` (200 units each). YouTube can only lift a ban by its ID, so bans made from the dock are remembered in `data/youtube_bans.json`; older bans have to be lifted in YouTube Studio. YouTube's API has no chat modes, warnings or ban reasons
 - The chat is meant for **you**: showing a merged chat on the Twitch stream itself conflicts with Twitch's simulcasting rules
 
 ### YouTube

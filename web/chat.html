@@ -10,7 +10,36 @@
     <span class="stat"><span class="plat twitch">T</span> <span id="tw-state" class="muted">…</span></span>
     <span class="stat"><span class="plat youtube">YT</span> <span id="yt-state" class="muted">…</span>
       <a id="yt-connect" href="#" hidden>connect</a></span>
+    <span id="modes"></span>
+    <button type="button" id="mod-btn" title="Moderation: Twitch chat modes, Shield Mode" aria-expanded="false" hidden>🛡</button>
   </header>
+
+  <section id="modpanel" class="popover" hidden>
+    <div class="pop-head"><strong>Twitch chat modes</strong><button type="button" class="pop-close" aria-label="Close">×</button></div>
+    <div id="mp-note" class="err" hidden></div>
+    <div class="mp-row"><span>Slow mode</span>
+      <select id="mp-slow">
+        <option value="0">off</option><option value="3">3 s</option><option value="5">5 s</option>
+        <option value="10">10 s</option><option value="20">20 s</option><option value="30">30 s</option>
+        <option value="60">60 s</option><option value="120">120 s</option>
+      </select></div>
+    <div class="mp-row"><span>Followers only</span>
+      <select id="mp-followers">
+        <option value="-1">off</option><option value="0">any follower</option><option value="10">10 min</option>
+        <option value="30">30 min</option><option value="60">1 h</option><option value="1440">1 day</option>
+        <option value="10080">1 week</option><option value="43200">1 month</option><option value="129600">3 months</option>
+      </select></div>
+    <label class="mp-row"><span>Subscribers only</span><input type="checkbox" id="mp-subs"></label>
+    <label class="mp-row"><span>Emote only</span><input type="checkbox" id="mp-emote"></label>
+    <label class="mp-row"><span>Unique chat</span><input type="checkbox" id="mp-unique"></label>
+    <div class="mp-actions">
+      <button type="button" id="mp-shield" class="mod-btn-shield">Shield Mode: …</button>
+      <button type="button" id="mp-clear" class="danger" data-confirm="Really clear?">Clear chat</button>
+    </div>
+    <div class="muted small">YouTube's API has no chat modes; use YouTube Studio for those. Type <code>/help</code> for commands.</div>
+  </section>
+
+  <section id="usercard" class="popover" hidden></section>
 
   <main id="feed" aria-live="polite"></main>
   <button id="more" hidden>new messages ↓</button>

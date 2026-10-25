@@ -123,6 +123,8 @@ function addMessage(m) {
   if (m.action && m.color) body.style.color = m.color;
   renderTokens(body, m.tokens || []);
   row.append(body);
+  row.msg = m;
+  if (moderatable(m)) row.append(modActions(m));
 
   feed.append(row);
   while (feed.childElementCount > MAX_MESSAGES) feed.firstElementChild.remove();
@@ -197,6 +199,7 @@ function handleIrc(line) {
     case 'ROOMSTATE':
       setTw('connected', 'ok');
       twBackoff = 1000;
+      updateRoomState(m.tags);
       break;
     case 'RECONNECT':
       ws.close();
@@ -206,10 +209,11 @@ function handleIrc(line) {
       const action = text.startsWith('\u0001ACTION ') && text.endsWith('\u0001');
       if (action) text = text.slice(8, -1);
       addMessage({
-        platform: 'twitch', kind: 'text', id: m.tags.id, action,
+        platform: 'twitch', kind: 'text', id: m.tags.id, action, login: m.prefix.split('!')[0],
         author: m.tags['display-name'] || m.prefix.split('!')[0],
         author_id: m.tags['user-id'], color: m.tags.color || null,
-        badges: twitchBadges(m.tags.badges),
+        badges: twitchBadges(m.tags.badges), badgesRaw: m.tags.badges, badgeInfo: m.tags['badge-info'],
+        ts: Number(m.tags['tmi-sent-ts']) || Date.now(),
         tokens: action ? twitchTokens(text, null) : twitchTokens(text, m.tags.emotes),
       });
       break;
@@ -218,8 +222,10 @@ function handleIrc(line) {
       addMessage({
         platform: 'twitch', kind: 'notice', id: m.tags.id,
         notice: m.tags['system-msg'] || m.tags['msg-id'] || 'notice',
-        author: m.trailing ? (m.tags['display-name'] || '') : '',
+        author: m.trailing ? (m.tags['display-name'] || '') : '', login: m.tags.login,
         author_id: m.tags['user-id'], color: m.tags.color || null,
+        badges: twitchBadges(m.tags.badges), badgesRaw: m.tags.badges, badgeInfo: m.tags['badge-info'],
+        ts: Number(m.tags['tmi-sent-ts']) || Date.now(),
         tokens: m.trailing ? twitchTokens(m.trailing, m.tags.emotes) : [],
       });
       break;
@@ -281,7 +287,7 @@ function ytMessage(m) {
   if (m.verified) badges.push('verified');
   addMessage({
     platform: 'youtube', kind: m.kind, id: m.id, author: m.author, author_id: m.author_id,
-    badges, amount: m.amount || null,
+    badges, amount: m.amount || null, avatar: m.avatar || null, ts: Date.parse(m.ts) || Date.now(),
     tokens: textTokens(m.text || ''),
   });
 }
@@ -341,6 +347,7 @@ $('send').addEventListener('submit', async ev => {
   const text = $('text').value.trim();
   const targets = selectedTargets();
   if (!text) return;
+  if (text.startsWith('/')) return runCommand(text);
   if (!targets.length) return showError('Pick at least one platform');
   $('text').disabled = true;
   try {
@@ -544,6 +551,517 @@ function acceptSuggestion(i) {
 $('text').addEventListener('input', updateAc);
 $('text').addEventListener('blur', () => setTimeout(closeAc, 100));
 
+// ---- moderation ----------------------------------------------------------------
+// Hover icons on messages, a user card (click a name), the Twitch chat-mode panel
+// (🛡 in the header) and Twitch-style slash commands. Everything goes through
+// POST /api/mod. Bans and clearing the chat need a second click to confirm.
+
+const PNAME = { twitch: 'Twitch', youtube: 'YouTube' };
+
+function canMod(platform) {
+  if (!cfg) return false;
+  return platform === 'twitch' ? !!(cfg.twitch && cfg.twitch.can_moderate) : !!cfg.youtube.can_moderate;
+}
+
+function hasUser(m) {
+  return !!(m && m.author && m.author_id && m.kind !== 'system');
+}
+
+function moderatable(m) {
+  return hasUser(m) && !(m.badges || []).includes('owner') && canMod(m.platform);
+}
+
+function targetOf(m) {
+  return { name: m.author, user_id: m.author_id, login: m.login, message_id: m.id };
+}
+
+function fmtDur(s) {
+  for (const [n, u] of [[604800, 'w'], [86400, 'd'], [3600, 'h'], [60, 'min']]) {
+    if (s >= n && s % n === 0) return `${s / n} ${u}`;
+  }
+  return `${s} s`;
+}
+
+// "600", "30s", "10m", "1h", "1d", "2w" -> seconds
+function parseDur(s) {
+  const m = /^(\d+)([smhdw]?)$/i.exec(s || '');
+  return m ? +m[1] * { '': 1, s: 1, m: 60, h: 3600, d: 86400, w: 604800 }[m[2].toLowerCase()] : null;
+}
+
+// First click arms the button for 3 s, the second one confirms.
+function armed(btn, label) {
+  if (btn.classList.contains('arming')) {
+    clearTimeout(btn._disarm);
+    btn.classList.remove('arming');
+    btn.textContent = btn._label;
+    return true;
+  }
+  btn._label = btn.textContent;
+  btn.textContent = label;
+  btn.classList.add('arming');
+  btn._disarm = setTimeout(() => { btn.classList.remove('arming'); btn.textContent = btn._label; }, 3000);
+  return false;
+}
+
+// Runs one action, reports success in the feed and errors under the input.
+// Rejects on error so callers can keep a card open.
+async function act(platform, action, target, opts = {}) {
+  const payload = { platform, action, ...opts };
+  if (target.user_id) payload[platform === 'twitch' ? 'user_id' : 'channel_id'] = target.user_id;
+  if (target.login) payload.login = target.login;
+  if (target.name) payload.name = target.name;
+  if (target.message_id) payload.message_id = target.message_id;
+  let r;
+  try {
+    r = await api('POST', '/api/mod', payload);
+  } catch (e) {
+    showError(`${PNAME[platform]}: ${e.message.replace(/^(Twitch|YouTube): /, '')}`);
+    throw e;
+  }
+  const who = (r.user && r.user.display_name) || target.name || target.login || 'user';
+  const uid = target.user_id || (r.user && r.user.id);
+  switch (action) {
+    case 'delete': removeById(target.message_id); break;
+    case 'timeout':
+      if (uid) removeByAuthor(`${platform}:${uid}`);
+      system(platform, `✓ ${who} timed out for ${fmtDur(opts.duration)}`);
+      break;
+    case 'ban':
+      if (uid) removeByAuthor(`${platform}:${uid}`);
+      system(platform, `✓ ${who} banned`);
+      break;
+    case 'unban': system(platform, `✓ ${who} unbanned`); break;
+    case 'warn': system(platform, `✓ ${who} warned: ${opts.reason}`); break;
+    case 'shoutout': system(platform, `✓ Shoutout to ${who}`); break;
+    case 'settings': if (r.settings) applySettings(r.settings); break;
+    case 'shield':
+      shieldOn = r.shield;
+      renderModes();
+      system('twitch', r.shield ? '🛡 Shield Mode on' : 'Shield Mode off');
+      break;
+  }
+  return r;
+}
+
+// -- hover icons
+
+function modActions(m) {
+  const box = el('span', 'mod-actions');
+  const t = targetOf(m);
+  const yt = m.platform === 'youtube';
+  const add = (icon, title, fn) => {
+    const b = el('button', null, icon);
+    b.type = 'button';
+    b.title = title;
+    b.addEventListener('click', ev => { ev.stopPropagation(); fn(b); });
+    box.append(b);
+  };
+  if (m.id) add('🗑', yt ? 'Delete message (20 quota units)' : 'Delete message',
+    () => act(m.platform, 'delete', t).catch(() => {}));
+  add('⏱', yt ? 'Timeout 10 min (200 quota units)' : 'Timeout 10 min',
+    () => act(m.platform, 'timeout', t, { duration: 600 }).catch(() => {}));
+  add('⛔', 'Ban (click twice)', b => { if (armed(b, '✓?')) act(m.platform, 'ban', t).catch(() => {}); });
+  return box;
+}
+
+// -- user card, laid out like Twitch's own viewer card
+
+let badgeMap = null;   // Twitch 'set/version' -> {url, title}
+let badgeLoad = null;
+function loadBadges() {
+  if (!badgeLoad) {
+    badgeLoad = api('GET', '/api/twitch/badges')
+      .then(r => (badgeMap = r.badges), () => { badgeLoad = null; return null; });
+  }
+  return badgeLoad;
+}
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+  'October', 'November', 'December'];
+function ordinal(n) {
+  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+function longDate(iso) {
+  const d = new Date(iso);
+  return `${MONTHS[d.getMonth()]} ${ordinal(d.getDate())}, ${d.getFullYear()}`;
+}
+function hhmm(ts) {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// Badge images from Twitch's badge list, text chips as fallback (YouTube, list not loaded).
+function badgeEls(m) {
+  if (m.platform === 'twitch' && badgeMap && m.badgesRaw) {
+    const out = [];
+    for (const b of m.badgesRaw.split(',')) {
+      const info = badgeMap[b];
+      if (!info) continue;
+      const img = el('img', 'badge-img');
+      img.src = info.url;
+      img.alt = img.title = info.title;
+      out.push(img);
+    }
+    return out;
+  }
+  return (m.badges || []).filter(b => BADGES[b]).map(b => el('span', `badge ${b}`, BADGES[b]));
+}
+
+function closeCard() { $('usercard').hidden = true; }
+
+function openCard(m) {
+  toggleModPanel(false);
+  const card = $('usercard');
+  card.replaceChildren();
+  const p = m.platform;
+  const t = targetOf(m);
+  const key = `${p}:${m.author_id}`;
+  card.dataset.key = key;
+  const stillOpen = () => !card.hidden && card.dataset.key === key;
+  const color = m.color || (p === 'youtube' ? '#f5c2e7' : '#cba6f7');
+
+  // banner: avatar, name in the user's colour, badges
+  const banner = el('div', 'uc-banner');
+  banner.style.setProperty('--uc-color', color);
+  const avatar = el('div', 'uc-avatar', (m.author[0] || '?').toUpperCase());
+  const setAvatar = url => {
+    if (!url) return;
+    const img = el('img');
+    img.alt = '';
+    img.onload = () => avatar.replaceChildren(img);  // keep the initial until the picture is there
+    img.src = url;
+  };
+  setAvatar(m.avatar);
+  const ident = el('div', 'uc-id');
+  const name = el('div', 'uc-name', m.author);
+  name.style.color = color;
+  const badges = el('div', 'uc-badges');
+  badges.append(...badgeEls(m));
+  ident.append(name, badges);
+  const tools = el('div', 'uc-tools');
+  const close = el('button', 'pop-close', '×');
+  close.type = 'button';
+  close.title = 'Close';
+  close.addEventListener('click', closeCard);
+  tools.append(el('span', `plat ${p}`, p === 'twitch' ? 'T' : 'YT'), close);
+  banner.append(avatar, ident, tools);
+  card.append(banner);
+
+  // info lines
+  const info = el('div', 'uc-info');
+  const line = (icon, text) => {
+    const d = el('div', 'uc-line');
+    d.append(el('span', 'uc-ico', icon), el('span', null, text));
+    info.append(d);
+    return d.lastChild;
+  };
+  if (p === 'twitch') {
+    if (!badgeMap) loadBadges().then(() => { if (stillOpen()) badges.replaceChildren(...badgeEls(m)); });
+    const created = line('🎂', 'Loading profile …');
+    api('GET', '/api/twitch/user?id=' + encodeURIComponent(m.author_id)).then(u => {
+      if (!stillOpen()) return;
+      setAvatar(u.profile_image_url);
+      created.textContent = `Account created on ${longDate(u.created_at)}`;
+      if (u.broadcaster_type) line('✔', u.broadcaster_type === 'partner' ? 'Twitch Partner' : 'Twitch Affiliate');
+    }).catch(e => { if (stillOpen()) created.textContent = e.message; });
+    const sub = /(?:^|,)(subscriber|founder)\/(\d+)/.exec(m.badgeInfo || '');
+    if (sub) line('★', `${sub[1] === 'founder' ? 'Founder, subscribed' : 'Subscribed'} for ${sub[2]} month${sub[2] === '1' ? '' : 's'}`);
+    if (m.login && m.login !== m.author.toLowerCase()) line('@', m.login);
+  } else {
+    line('▶', 'YouTube channel');
+    if ((m.badges || []).includes('member')) line('★', 'Channel member');
+  }
+  card.append(info);
+
+  // moderation
+  const actions = el('div', 'uc-actions');
+  if ((m.badges || []).includes('owner')) {
+    actions.append(el('div', 'muted small', 'That is you.'));
+  } else if (!canMod(p)) {
+    actions.append(el('div', 'err small', p === 'twitch'
+      ? 'Log in to Twitch again in the Stream Info dock to allow moderation.'
+      : 'Log in to YouTube in the Stream Info dock to moderate.'));
+  } else {
+    const reason = el('input', 'uc-reason');
+    reason.placeholder = p === 'twitch' ? 'Reason (optional, needed for warn)' : 'YouTube takes no reasons';
+    reason.maxLength = 500;
+    reason.disabled = p === 'youtube';
+    actions.append(reason);
+    const R = () => reason.value.trim() || undefined;
+    const row = label => { const r = el('div', 'uc-row'); r.append(el('span', null, label)); actions.append(r); return r; };
+    const btn = (parent, text, fn, cls) => {
+      const b = el('button', cls, text);
+      b.type = 'button';
+      b.addEventListener('click', () => fn(b));
+      parent.append(b);
+    };
+    const done = promise => promise.then(closeCard, () => {});  // stays open on error
+
+    const to = row('Timeout');
+    const durations = [60, 600, 3600, 86400].concat(p === 'twitch' ? [604800] : []);
+    for (const s of durations) btn(to, fmtDur(s), () => done(act(p, 'timeout', t, { duration: s, reason: R() })));
+    const ban = row('Ban');
+    btn(ban, 'Permanent', b => { if (armed(b, 'Really ban?')) done(act(p, 'ban', t, { reason: R() })); }, 'danger');
+    btn(ban, 'Unban', () => done(act(p, 'unban', t)));
+    if (p === 'twitch') {
+      const more = row('More');
+      btn(more, 'Warn', () => {
+        if (!R()) { reason.focus(); return showError('A warning needs a reason'); }
+        done(act(p, 'warn', t, { reason: R() }));
+      });
+      btn(more, 'Shoutout', () => done(act(p, 'shoutout', t)));
+    }
+    const msgRow = [...feed.querySelectorAll('.msg')].find(r => r.dataset.id === m.id);
+    if (m.id && msgRow && !msgRow.classList.contains('deleted')) {
+      btn(row('Message'), 'Delete this message', () => done(act(p, 'delete', t)));
+    }
+    if (p === 'youtube') {
+      actions.append(el('div', 'muted small', 'Quota: delete 20, timeout/ban/unban 200 units each (10,000 per day). '
+        + 'Unban works for bans made from this dock.'));
+    }
+  }
+  card.append(actions);
+
+  // this user's messages in the feed, with time and badges
+  const rows = [...feed.querySelectorAll('.msg')].filter(r => r.dataset.author === key && r.msg);
+  card.append(el('div', 'uc-divider', `${rows.length} message${rows.length === 1 ? '' : 's'} in this feed`));
+  const log = el('div', 'uc-log');
+  for (const r of rows.slice(-30)) {
+    const mm = r.msg;
+    const ln = el('div', r.classList.contains('deleted') ? 'deleted' : null);
+    ln.append(el('time', null, mm.ts ? hhmm(mm.ts) : ''), ...badgeEls(mm));
+    const nm = el('span', 'name', mm.author);
+    nm.style.color = color;
+    ln.append(nm, document.createTextNode(mm.action ? ' ' : ': '));
+    const text = r.querySelector('.text');
+    if (text) ln.append(text.cloneNode(true));  // our own rendered nodes: text and emote images
+    log.append(ln);
+  }
+  if (rows.length) card.append(log);
+
+  card.hidden = false;
+  log.scrollTop = log.scrollHeight;
+}
+
+feed.addEventListener('click', ev => {
+  const n = ev.target.closest('.name');
+  const row = n && n.closest('.msg');
+  if (row && hasUser(row.msg)) openCard(row.msg);
+});
+
+// -- Twitch chat modes (ROOMSTATE from IRC) and Shield Mode
+
+let roomState = null;
+let shieldOn = null;
+
+function updateRoomState(tags) {
+  const prev = roomState;
+  const s = { ...(roomState || {}) };
+  if ('slow' in tags) s.slow = Number(tags.slow);
+  if ('followers-only' in tags) s.followers = Number(tags['followers-only']);
+  if ('subs-only' in tags) s.subs = tags['subs-only'] === '1';
+  if ('emote-only' in tags) s.emote = tags['emote-only'] === '1';
+  if ('r9k' in tags) s.unique = tags.r9k === '1';
+  roomState = s;
+  if (prev) {
+    const on = (a, b, label) => { if (!!a !== !!b) system('twitch', `${label} ${b ? 'on' : 'off'}`); };
+    if (prev.slow !== s.slow) system('twitch', s.slow ? `Slow mode on (${s.slow} s)` : 'Slow mode off');
+    if (prev.followers !== s.followers) {
+      system('twitch', s.followers >= 0 ? `Followers-only on${s.followers ? ` (${fmtDur(s.followers * 60)})` : ''}`
+        : 'Followers-only off');
+    }
+    on(prev.subs, s.subs, 'Subscribers-only');
+    on(prev.emote, s.emote, 'Emote-only');
+    on(prev.unique, s.unique, 'Unique chat');
+  }
+  renderModes();
+}
+
+// Helix chat settings -> the same shape as ROOMSTATE, so both paths agree.
+function applySettings(st) {
+  updateRoomState({
+    slow: st.slow_mode ? String(st.slow_mode_wait_time || 0) : '0',
+    'followers-only': st.follower_mode ? String(st.follower_mode_duration || 0) : '-1',
+    'subs-only': st.subscriber_mode ? '1' : '0',
+    'emote-only': st.emote_mode ? '1' : '0',
+    r9k: st.unique_chat_mode ? '1' : '0',
+  });
+}
+
+function renderModes() {
+  const box = $('modes');
+  box.replaceChildren();
+  const s = roomState || {};
+  const chip = (text, cls, title) => {
+    const c = el('span', `mode-chip ${cls || ''}`, text);
+    if (title) c.title = title;
+    box.append(c);
+  };
+  if (shieldOn) chip('SHIELD', 'shield', 'Shield Mode is on');
+  if (s.slow) chip(`SLOW ${s.slow}s`, '', 'Slow mode');
+  if (s.followers >= 0) chip(s.followers ? `FOLLOW ${fmtDur(s.followers * 60).replace(' ', '')}` : 'FOLLOW', '', 'Followers-only');
+  if (s.subs) chip('SUB', '', 'Subscribers-only');
+  if (s.emote) chip('EMOTE', '', 'Emote-only');
+  if (s.unique) chip('UNIQUE', '', 'Unique chat');
+  syncPanel();
+}
+
+function setSelect(sel, value, label) {
+  const v = String(value);
+  if (![...sel.options].some(o => o.value === v)) sel.append(new Option(label(value), v));
+  sel.value = v;
+}
+
+function syncPanel() {
+  const s = roomState || {};
+  setSelect($('mp-slow'), s.slow || 0, v => `${v} s`);
+  setSelect($('mp-followers'), s.followers ?? -1, v => fmtDur(v * 60));
+  $('mp-subs').checked = !!s.subs;
+  $('mp-emote').checked = !!s.emote;
+  $('mp-unique').checked = !!s.unique;
+  $('mp-shield').textContent = `Shield Mode: ${shieldOn == null ? '?' : shieldOn ? 'ON' : 'off'}`;
+  $('mp-shield').classList.toggle('on', !!shieldOn);
+}
+
+async function refreshShield() {
+  try {
+    const r = await api('GET', '/api/mod/twitch/state');
+    shieldOn = r.shield;
+    if (r.settings && !roomState) applySettings(r.settings);
+    renderModes();
+  } catch (e) { /* the panel shows '?' */ }
+}
+setInterval(() => { if (cfg && cfg.twitch && cfg.twitch.can_moderate) refreshShield(); }, 60 * 1000);
+
+function setModes(settings) {
+  act('twitch', 'settings', {}, { settings }).catch(syncPanel);  // on error: show the real state again
+}
+
+function toggleModPanel(open = $('modpanel').hidden) {
+  if (open) {
+    closeCard();
+    if (!$('picker').hidden) togglePicker(false);
+    const can = canMod('twitch');
+    $('mp-note').textContent = can ? '' : 'Log in to Twitch again in the Stream Info dock to allow moderation.';
+    $('mp-note').hidden = can;
+    for (const c of $('modpanel').querySelectorAll('select, input, .mp-actions button')) c.disabled = !can;
+    if (can) refreshShield();
+    syncPanel();
+  }
+  $('modpanel').hidden = !open;
+  $('mod-btn').setAttribute('aria-expanded', String(open));
+}
+
+$('mod-btn').addEventListener('click', () => toggleModPanel());
+$('modpanel').querySelector('.pop-close').addEventListener('click', () => toggleModPanel(false));
+$('mp-slow').addEventListener('change', e => {
+  const v = +e.target.value;
+  setModes(v ? { slow_mode: true, slow_mode_wait_time: v } : { slow_mode: false });
+});
+$('mp-followers').addEventListener('change', e => {
+  const v = +e.target.value;
+  setModes(v >= 0 ? { follower_mode: true, follower_mode_duration: v } : { follower_mode: false });
+});
+$('mp-subs').addEventListener('change', e => setModes({ subscriber_mode: e.target.checked }));
+$('mp-emote').addEventListener('change', e => setModes({ emote_mode: e.target.checked }));
+$('mp-unique').addEventListener('change', e => setModes({ unique_chat_mode: e.target.checked }));
+$('mp-shield').addEventListener('click', () => act('twitch', 'shield', {}, { active: !shieldOn }).catch(() => {}));
+$('mp-clear').addEventListener('click', e => {
+  if (armed(e.currentTarget, 'Really clear?')) act('twitch', 'clear', {}).catch(() => {});
+});
+
+document.addEventListener('mousedown', ev => {
+  if (!$('usercard').hidden && !ev.target.closest('#usercard, .msg .name')) closeCard();
+  if (!$('modpanel').hidden && !ev.target.closest('#modpanel, #mod-btn')) toggleModPanel(false);
+});
+document.addEventListener('keydown', ev => {
+  if (ev.key !== 'Escape') return;
+  if (!$('usercard').hidden) closeCard();
+  if (!$('modpanel').hidden) toggleModPanel(false);
+});
+
+// -- slash commands (act on Twitch, like in Twitch's own chat)
+
+class UsageError extends Error {}
+
+function user(u) {
+  if (!u) throw new UsageError();
+  const login = u.replace(/^@/, '');
+  return { login, name: login };
+}
+
+function modes(settings) { return act('twitch', 'settings', {}, { settings }); }
+
+const COMMANDS = {
+  ban: ['<user> [reason]', ([u, ...r]) => act('twitch', 'ban', user(u), { reason: r.join(' ') || undefined })],
+  unban: ['<user>', ([u]) => act('twitch', 'unban', user(u))],
+  timeout: ['<user> [duration: 600, 10m, 1h, 1d, 2w] [reason]', ([u, d, ...r]) => {
+    let duration = 600;
+    if (d !== undefined) {
+      const p = parseDur(d);
+      if (p === null) r.unshift(d); else duration = p;
+    }
+    return act('twitch', 'timeout', user(u), { duration, reason: r.join(' ') || undefined });
+  }],
+  untimeout: ['<user>', ([u]) => act('twitch', 'unban', user(u))],
+  warn: ['<user> <reason>', ([u, ...r]) => {
+    if (!r.length) throw new UsageError();
+    return act('twitch', 'warn', user(u), { reason: r.join(' ') });
+  }],
+  shoutout: ['<user>', ([u]) => act('twitch', 'shoutout', user(u))],
+  clear: ['', () => act('twitch', 'clear', {})],
+  slow: ['[seconds, 3-120]', ([s]) => {
+    const v = s === undefined ? 30 : parseDur(s);
+    if (v === null || v < 3 || v > 120) throw new UsageError();
+    return modes({ slow_mode: true, slow_mode_wait_time: v });
+  }],
+  slowoff: ['', () => modes({ slow_mode: false })],
+  followers: ['[minutes or 10m, 1h, 1d, 1w; default 0]', ([d]) => {
+    const v = d === undefined ? 0 : /^\d+$/.test(d) ? +d : (parseDur(d) ?? NaN) / 60;
+    if (!Number.isInteger(v) || v < 0 || v > 129600) throw new UsageError();
+    return modes({ follower_mode: true, follower_mode_duration: v });
+  }],
+  followersoff: ['', () => modes({ follower_mode: false })],
+  subscribers: ['', () => modes({ subscriber_mode: true })],
+  subscribersoff: ['', () => modes({ subscriber_mode: false })],
+  emoteonly: ['', () => modes({ emote_mode: true })],
+  emoteonlyoff: ['', () => modes({ emote_mode: false })],
+  uniquechat: ['', () => modes({ unique_chat_mode: true })],
+  uniquechatoff: ['', () => modes({ unique_chat_mode: false })],
+  shield: ['', () => act('twitch', 'shield', {}, { active: true })],
+  shieldoff: ['', () => act('twitch', 'shield', {}, { active: false })],
+  help: ['', () => {
+    system('twitch', 'Commands act on Twitch. Moderate YouTube with the icons on a message or by clicking a name.');
+    for (const [name, [usage]] of Object.entries(COMMANDS)) if (name !== 'help') system('twitch', `/${name} ${usage}`);
+    system('twitch', 'Aliases: /so = /shoutout, /r9kbeta = /uniquechat');
+  }],
+};
+const ALIASES = { so: 'shoutout', r9kbeta: 'uniquechat', r9kbetaoff: 'uniquechatoff', followersonly: 'followers',
+  followersonlyoff: 'followersoff', subs: 'subscribers', subsoff: 'subscribersoff', untimeoutuser: 'untimeout' };
+
+async function runCommand(text) {
+  const [cmd, ...args] = text.slice(1).split(/\s+/);
+  const name = ALIASES[cmd.toLowerCase()] || cmd.toLowerCase();
+  const c = COMMANDS[name];
+  if (!c) return showError(`Unknown command /${cmd}. /help lists the commands`);
+  if (name !== 'help' && !canMod('twitch')) {
+    return showError('Log in to Twitch again in the Stream Info dock to allow moderation');
+  }
+  $('text').disabled = true;
+  try {
+    await c[1](args);
+    $('text').value = '';
+  } catch (e) {
+    if (e instanceof UsageError) showError(`Usage: /${name} ${c[0]}`);
+    // API errors were already shown by act()
+  } finally {
+    $('text').disabled = false;
+    $('text').focus();
+    updateCount();
+  }
+}
+
 // ---- start -------------------------------------------------------------------
 
 let emoteRetry = null;
@@ -576,6 +1094,9 @@ async function start() {
   $('to-twitch').parentElement.title = !tw ? 'Not logged in to Twitch'
     : tw.can_send ? 'Send to Twitch' : 'Log in to Twitch again in the Stream Info dock to allow sending';
   $('to-youtube').disabled = !cfg.youtube.logged_in;
+  $('mod-btn').hidden = !tw;
+  if (tw && tw.can_moderate) refreshShield();
+  if (tw) loadBadges();  // so the user card opens with badge images right away
   updateCount();
 
   loadEmotes();

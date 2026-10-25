@@ -50,7 +50,7 @@ function setText(root, sel, text) { root.querySelector(sel).textContent = text; 
 
 const SCOPE_LABELS = { 'user:write:chat': 'chat', 'user:read:emotes': 'emotes' };
 function scopeLabels(scopes) {
-  return [...new Set(scopes.map(s => SCOPE_LABELS[s] || s))].join(', ');
+  return [...new Set(scopes.map(s => SCOPE_LABELS[s] || (s.startsWith('moderator:') ? 'moderation' : s)))].join(', ');
 }
 
 function renderAccount(key, st) {
